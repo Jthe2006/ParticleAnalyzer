@@ -54,6 +54,15 @@ def assets_path(name: str):
     return os.path.join(os.path.dirname(__file__), "..", "assets", name)
 
 
+def shape_analysis_visibility(spherical_enabled, nanorod_enabled):
+    """Show only the thresholds used by the active shape-analysis mode."""
+
+    return (
+        gr.update(visible=bool(spherical_enabled) and not bool(nanorod_enabled)),
+        gr.update(visible=bool(nanorod_enabled)),
+    )
+
+
 point_manager = PointManager()
 analyzer = ParticleAnalyzer()
 enhancement_pipelines = EnhancementPipeline.get_pipeline_names()
@@ -291,6 +300,20 @@ def create_interface(api_key):
                                         output_plot = gr.Plot(
                                             label=i18n("Графики распределения")
                                         )
+                                with gr.Tab(
+                                    i18n("Nanorod aspect-ratio chart"), id=7
+                                ):
+                                    gr.Markdown(
+                                        i18n(
+                                            "Projected aspect ratio = orthogonal-caliper length / minimum-Feret width; it is dimensionless and describes a 2D projection."
+                                        )
+                                    )
+                                    with gr.Row():
+                                        nanorod_plot = gr.Plot(
+                                            label=i18n(
+                                                "Nanorod aspect-ratio chart"
+                                            )
+                                        )
                                 with gr.Tab(i18n("Ориентация"), id=3):
                                     with gr.Row():
                                         vector_field = gr.Plot(
@@ -439,13 +462,21 @@ def create_interface(api_key):
                         )
                         with gr.Row():
                             spherical_filter_enabled = gr.Checkbox(
-                                value=True,
+                                value=False,
                                 label=i18n("Keep near-circular particles only"),
                                 info=i18n(
                                     "Uses circularity and axis ratio as a 2D proxy for sphericity."
                                 ),
                             )
-                        with gr.Row() as spherical_filter_row:
+                        with gr.Row():
+                            nanorod_mode_enabled = gr.Checkbox(
+                                value=True,
+                                label=i18n("Analyze nanorods"),
+                                info=i18n(
+                                    "Measures rod length and width with orthogonal Feret calipers. Nanorod mode overrides the near-circular filter."
+                                ),
+                            )
+                        with gr.Row(visible=False) as spherical_filter_row:
                             min_circularity = gr.Slider(
                                 minimum=0.0,
                                 maximum=1.0,
@@ -459,6 +490,24 @@ def create_interface(api_key):
                                 value=0.80,
                                 step=0.01,
                                 label=i18n("Minimum axis ratio (minor/major)"),
+                            )
+                        with gr.Row(visible=True) as nanorod_filter_row:
+                            min_nanorod_aspect_ratio = gr.Slider(
+                                minimum=1.0,
+                                maximum=20.0,
+                                value=2.0,
+                                step=0.1,
+                                label=i18n("Minimum nanorod aspect ratio (L/W)"),
+                                info=i18n(
+                                    "Length is the caliper span perpendicular to the minimum Feret width."
+                                ),
+                            )
+                            exclude_border_rods = gr.Checkbox(
+                                value=True,
+                                label=i18n("Exclude border-touching rods"),
+                                info=i18n(
+                                    "Recommended because clipped rods bias aspect-ratio statistics."
+                                ),
                             )
                     with gr.Group():
                         gr.Markdown(
@@ -651,6 +700,9 @@ def create_interface(api_key):
                 spherical_filter_enabled,
                 min_circularity,
                 min_axis_ratio,
+                nanorod_mode_enabled,
+                min_nanorod_aspect_ratio,
+                exclude_border_rods,
                 show_Feret_diametr,
                 show_Scale_bar,
                 outline_color,
@@ -682,6 +734,7 @@ def create_interface(api_key):
                 sidebar,
                 output_image_row,
                 image_name,
+                nanorod_plot,
             ],
             show_progress_on=in_image,
         )
@@ -748,8 +801,15 @@ def create_interface(api_key):
                 fill_type_color,
                 fill_color,
                 fill_alpha,
+                min_nanorod_aspect_ratio,
             ],
-            outputs=[output_image, output_table2, output_plot, vector_field],
+            outputs=[
+                output_image,
+                output_table2,
+                output_plot,
+                vector_field,
+                nanorod_plot,
+            ],
         )
         
         gr.on(
@@ -804,8 +864,15 @@ def create_interface(api_key):
                 fill_type_color,
                 fill_color,
                 fill_alpha,
+                min_nanorod_aspect_ratio,
             ],
-            outputs=[output_image, output_table2, output_plot, vector_field],
+            outputs=[
+                output_image,
+                output_table2,
+                output_plot,
+                vector_field,
+                nanorod_plot,
+            ],
         )
 
         llm_start = llm_run.click(
@@ -840,10 +907,14 @@ def create_interface(api_key):
             show_progress_on=slice_row,
         )
 
-        spherical_filter_enabled.change(
-            lambda enabled: gr.update(visible=enabled),
-            inputs=spherical_filter_enabled,
-            outputs=spherical_filter_row,
+        gr.on(
+            triggers=[
+                spherical_filter_enabled.change,
+                nanorod_mode_enabled.change,
+            ],
+            fn=shape_analysis_visibility,
+            inputs=[spherical_filter_enabled, nanorod_mode_enabled],
+            outputs=[spherical_filter_row, nanorod_filter_row],
             show_progress="hide",
         )
 
@@ -866,6 +937,7 @@ def create_interface(api_key):
                 scale_input_status,
                 scale,
                 output_image_row,
+                nanorod_plot,
             ],
             cancels=[analyze],
             show_progress="hide",
@@ -885,6 +957,7 @@ def create_interface(api_key):
                 results_row,
                 sidebar,
                 output_image_row,
+                nanorod_plot,
             ],
             show_progress="hide",
             show_progress_on=question_row,

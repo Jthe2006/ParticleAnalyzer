@@ -8,7 +8,6 @@ import os
 import gc
 from tqdm import tqdm
 from typing import Optional, Tuple, Dict, List
-from scipy.spatial.distance import pdist
 import random
 import re
 from PIL import Image
@@ -37,6 +36,12 @@ from particleanalyzer.core.shape_filter import (
     calculate_shape_metrics,
     passes_shape_filter,
 )
+from particleanalyzer.core.nanorod_analysis import (
+    calculate_nanorod_metrics,
+    contour_touches_image_border,
+    passes_nanorod_filter,
+)
+from particleanalyzer.core.nanorod_chart import build_nanorod_aspect_ratio_chart
 
 lang = "en"
 
@@ -141,25 +146,26 @@ class ParticleAnalyzer:
     def _create_error_return(self) -> Tuple:
         """Создает кортеж для возврата в случае ошибки"""
         return (
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            gr.update(visible=False),
-            gr.update(visible=False),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            gr.update(visible=False),
-            gr.update(visible=False),
-            None,
+            None,  # output_image
+            None,  # output_table
+            None,  # points_df
+            None,  # output_plot
+            None,  # vector_field
+            None,  # output_table2
+            gr.update(visible=False),  # chatbot_row
+            gr.update(visible=False),  # results_row
+            None,  # d_max_slider
+            None,  # d_min_slider
+            None,  # theta_max_slider
+            None,  # theta_min_slider
+            None,  # e_slider
+            None,  # S_slider
+            None,  # P_slider
+            None,  # I_slider
+            gr.update(visible=False),  # sidebar
+            gr.update(visible=False),  # output_image_row
+            None,  # image_name
+            None,  # nanorod_plot
         )
 
     def analyze_image(
@@ -184,6 +190,9 @@ class ParticleAnalyzer:
         spherical_filter_enabled: bool,
         min_circularity: float,
         min_axis_ratio: float,
+        nanorod_mode_enabled: bool,
+        min_nanorod_aspect_ratio: float,
+        exclude_border_rods: bool,
         show_Feret_diametr: bool,
         show_Scale_bar: bool,
         outline_color,
@@ -261,6 +270,9 @@ class ParticleAnalyzer:
                 "spherical_filter_enabled": spherical_filter_enabled,
                 "min_circularity": min_circularity,
                 "min_axis_ratio": min_axis_ratio,
+                "nanorod_mode_enabled": nanorod_mode_enabled,
+                "min_nanorod_aspect_ratio": min_nanorod_aspect_ratio,
+                "exclude_border_rods": exclude_border_rods,
                 "show_Feret_diametr": show_Feret_diametr,
                 "outline_color": outline_color,
                 "show_fillPoly": show_fillPoly,
@@ -280,10 +292,15 @@ class ParticleAnalyzer:
                 return self._create_error_return()
 
             if not particle_data:
+                no_match_message = (
+                    "No nanorods matched the selected aspect-ratio and quality "
+                    "criteria. Lower the threshold or allow border-touching rods."
+                    if nanorod_mode_enabled
+                    else "No particles matched the 2D shape filter. Lower the "
+                    "thresholds or disable the filter."
+                )
                 gr.Info(
-                    self._get_translation(
-                        "No particles matched the 2D shape filter. Lower the thresholds or disable the filter."
-                    )
+                    self._get_translation(no_match_message)
                 )
                 self._cleanup(pbar)
                 return self._create_error_return()
@@ -321,6 +338,12 @@ class ParticleAnalyzer:
             pbar.set_description(self._get_translation("Построение графиков..."))
             pr(0.9, desc=self._get_translation("Построение графиков..."))
             fig, vector_fig = builder.build_distribution_fig(image)
+            nanorod_fig = build_nanorod_aspect_ratio_chart(
+                df,
+                number_of_bins=number_of_bins,
+                min_aspect_ratio=min_nanorod_aspect_ratio,
+                lang=self.lang,
+            )
             pbar.update(1)
 
             pr(1, desc=self._get_translation("Готово!"))
@@ -380,6 +403,7 @@ class ParticleAnalyzer:
                 gr.update(visible=True),
                 gr.update(visible=True),
                 image_name,
+                nanorod_fig,
             )
         except Exception as e:
             self._handle_error(e)
@@ -692,8 +716,6 @@ class ParticleAnalyzer:
         # Вычисление базовых характеристик
         area = cv2.contourArea(points)
         perimeter = cv2.arcLength(points, closed=True)
-        distances = pdist(points[:, 0, :])
-        diameter = np.max(distances) if len(distances) > 0 else 0
 
         # Эксцентриситет
         eccentricity = 0
@@ -703,35 +725,31 @@ class ParticleAnalyzer:
             a, b = max(major_axis, minor_axis) / 2, min(major_axis, minor_axis) / 2
             eccentricity = np.sqrt(1 - (b**2 / a**2)) if a > b else 0
 
-        # Расчет Feret-диаметров и углов
-        def get_feret(contour, angles=np.arange(0, 180, 1)):
-            feret_values = []
-            feret_angles = []
-
-            for angle in angles:
-                M = cv2.getRotationMatrix2D((0, 0), angle, 1)
-                rotated = cv2.transform(contour, M)
-                x_coords = rotated[:, 0, 0]
-                feret = x_coords.max() - x_coords.min()
-                feret_values.append(feret)
-                feret_angles.append(angle)
-
-            feret_max = max(feret_values)
-            feret_min = min(feret_values)
-            feret_mean = np.mean(feret_values)
-            angle_max = feret_angles[feret_values.index(feret_max)]
-            angle_min = feret_angles[feret_values.index(feret_min)]
-
-            return feret_max, feret_min, feret_mean, angle_max, angle_min
-
-        feret_max, feret_min, feret_mean, angle_max, angle_min = get_feret(points)
+        nanorod_metrics = calculate_nanorod_metrics(points)
+        diameter = nanorod_metrics.feret_max
+        feret_max = nanorod_metrics.feret_max
+        feret_min = nanorod_metrics.feret_min
+        feret_mean = nanorod_metrics.feret_mean
+        angle_max = nanorod_metrics.feret_max_angle
+        angle_min = nanorod_metrics.feret_min_angle
+        touches_border = contour_touches_image_border(
+            points, config["output_image"].shape
+        )
 
         shape_metrics = calculate_shape_metrics(
             area=area,
             perimeter=perimeter,
             contour=points,
         )
-        if not passes_shape_filter(
+        if config.get("nanorod_mode_enabled", False):
+            if not passes_nanorod_filter(
+                metrics=nanorod_metrics,
+                min_aspect_ratio=config.get("min_nanorod_aspect_ratio", 2.0),
+                touches_border=touches_border,
+                exclude_border_rods=config.get("exclude_border_rods", True),
+            ):
+                return config["particle_counter"]
+        elif not passes_shape_filter(
             metrics=shape_metrics,
             enabled=config["spherical_filter_enabled"],
             min_circularity=config["min_circularity"],
@@ -836,6 +854,22 @@ class ParticleAnalyzer:
                 "Axis ratio": round(
                     shape_metrics.axis_ratio, config["round_value"]
                 ),
+                "Rod length [{}]".format(unit): round(
+                    nanorod_metrics.length * scale_factor, config["round_value"]
+                ),
+                "Rod width [{}]".format(unit): round(
+                    nanorod_metrics.width * scale_factor, config["round_value"]
+                ),
+                "Nanorod aspect ratio (L/W)": round(
+                    nanorod_metrics.aspect_ratio, config["round_value"]
+                ),
+                "ISO Feret ratio (min/max)": round(
+                    nanorod_metrics.iso_feret_ratio, config["round_value"]
+                ),
+                "Rod orientation [°]": round(
+                    nanorod_metrics.orientation, config["round_value"]
+                ),
+                "Border touching": touches_border,
                 "points": points.tolist(),
             }
         )

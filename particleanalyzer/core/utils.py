@@ -10,6 +10,7 @@ from particleanalyzer.core.language_context import LanguageContext
 from particleanalyzer.core.ParticleAnalyzer import ParticleAnalyzer
 from particleanalyzer.core.StatisticsBuilder import StatisticsBuilder
 from particleanalyzer.core.ImagePreprocessor import ImagePreprocessor
+from particleanalyzer.core.nanorod_chart import build_nanorod_aspect_ratio_chart
 
 
 def assets_path(name: str):
@@ -120,7 +121,7 @@ def reset_interface():
         None,  # Очищаем input_image
         gr.update(visible=False),  # Скрываем строку output_table_image2_row
         gr.update(visible=False),  # Скрываем строку reset_delete_buttons_row
-        gr.Chatbot(type="messages"),  # Очищаем chatbot
+        gr.Chatbot(type="messages", allow_tags=False),  # Очищаем chatbot
         gr.update(visible=False),  # Скрываем строку results_row
         gr.update(visible=False),  # Скрываем sidebar
         gr.update(visible=True),  # Показываем строку row_image_file
@@ -131,6 +132,7 @@ def reset_interface():
         ),  # Очищаем scale_input_status
         None,  # Очищаем scale
         gr.update(visible=False),  # Скрываем output_image_row
+        None,  # Очищаем nanorod_plot
     )
 
 
@@ -144,10 +146,11 @@ def reset_interface2():
         None,  # Очищаем vector_field
         gr.update(visible=False),  # Скрываем строку output_table_image2_row
         gr.update(visible=False),  # Скрываем строку reset_delete_buttons_row
-        gr.Chatbot(type="messages"),  # Очищаем chatbot
+        gr.Chatbot(type="messages", allow_tags=False),  # Очищаем chatbot
         gr.update(visible=False),  # Скрываем строку results_row
         gr.update(visible=False),  # Скрываем sidebar
         gr.update(visible=False),  # Скрываем output_image_row
+        None,  # Очищаем nanorod_plot
     )
 
 
@@ -257,10 +260,23 @@ def statistic_an(
     fill_type_color,
     fill_color,
     fill_alpha,
+    min_nanorod_aspect_ratio,
 ):
 
     if in_image is None:
-        return None, None, None, None
+        return None, None, None, None, None
+
+    # Slider/style events can be dispatched while the main analysis callback is
+    # still publishing its outputs.  In that short window the image and particle
+    # table may already be available while the hidden contour table is still
+    # ``None``.  Skipping the refresh preserves the freshly rendered analysis
+    # instead of replacing it with a Gradio component error.
+    if (
+        not isinstance(df, pd.DataFrame)
+        or not isinstance(points_df, pd.DataFrame)
+        or "points" not in points_df.columns
+    ):
+        return tuple(gr.skip() for _ in range(5))
 
     lang = LanguageContext.get_language()
     scale_config = ParticleAnalyzer.SCALE_OPTIONS[scale_selector]
@@ -297,6 +313,9 @@ def statistic_an(
         & (df.iloc[:, 10] <= I_max)
     ].copy()
 
+    if not filtered_df.index.isin(points_df.index).all():
+        return tuple(gr.skip() for _ in range(5))
+
     filtered_points_df = points_df.loc[filtered_df.index].copy()
 
     builder = StatisticsBuilder(
@@ -308,6 +327,12 @@ def statistic_an(
     )
     stats_df = builder.build_stats_table()
     fig, vector_fig = builder.build_distribution_fig(selected_image)
+    nanorod_fig = build_nanorod_aspect_ratio_chart(
+        filtered_df,
+        number_of_bins=number_of_bins,
+        min_aspect_ratio=min_nanorod_aspect_ratio,
+        lang=lang,
+    )
 
     thickness = ParticleAnalyzer._get_scaled_thickness(
         selected_image.shape[1], selected_image.shape[0]
@@ -350,6 +375,7 @@ def statistic_an(
         stats_df,
         fig,
         vector_fig,
+        nanorod_fig,
     )
 
 

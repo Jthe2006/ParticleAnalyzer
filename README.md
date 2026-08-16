@@ -69,6 +69,7 @@ If the model cannot segment your images correctly, please send them to rybakov-k
 - Automated particle segmentation in SEM images
 - SAHI mode enables accurate detection of small particles in high-resolution images via a sliding window method
 - Comprehensive statistical analysis of particle characteristics
+- Nanorod length, width, orientation, and aspect-ratio analysis
 - Interactive visualization of size distributions
 - Dual unit support — switch between pixels and micrometers (µm)
 - Supports multiple AI models: YOLOv11, YOLOv12, YOLOv26, RF-DETR Seg (Preview) and Detectron2
@@ -165,6 +166,8 @@ ParticleAnalyzer run --port 5000 --api-key YOUR_OPENROUTER_API_KEY
 - Feret diameters and angles (px or µm and °)
 - Eccentricity (unitless)
 - Intensity values (grayscale units)
+- Nanorod length and width (px, nm, or µm), orientation (°), and projected
+  aspect ratio (L/W)
 
 ### Size Distribution Visualization
 <div align="center">
@@ -202,6 +205,17 @@ https://github.com/user-attachments/assets/6548071a-3c83-4539-897a-6ebf175bec17
   These values are adjustable, and the filter can be disabled. Because SEM/TEM
   images are 2D projections, this is a sphericity proxy rather than proof of a
   particle's 3D shape.
+- **Nanorod Mode**: Measure each straight rod with an exact convex-hull caliper
+  algorithm. Width is the minimum Feret diameter; length is the caliper span
+  perpendicular to that width; projected aspect ratio is `length / width`.
+  This local build starts in Nanorod mode. It overrides the near-circular
+  filter, uses an adjustable default cutoff of L/W >= 2.0, and excludes
+  border-truncated rods by default. The CSV and statistics outputs also include
+  the ISO-style Feret ratio `min / max`.
+- **Nanorod Aspect-Ratio Chart**: A dedicated result tab shows the retained
+  `L/W` histogram with mean, median, and cutoff markers, plus a width-versus-
+  length scatter plot colored by `L/W`. Border-touching rods use a separate
+  marker and every point exposes length, width, orientation, and ratio on hover.
 - **Max Detections**: Maximum number of particles to detect
 - **Scaling Mode**: Pixel/µm unit selection
 - **Image Resolution**: Output resolution control

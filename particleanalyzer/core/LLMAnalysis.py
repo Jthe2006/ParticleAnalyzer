@@ -78,9 +78,12 @@ class LLMAnalysis:
 
     def _calc_aspect_ratio(self, df, num_bins):
         """Вычисляет аспектное соотношение"""
-        dmax_col = [c for c in df.columns if "Dₘₐₓ" in c][0]
-        dmin_col = [c for c in df.columns if "Dₘᵢₙ" in c][0]
-        ar = df[dmax_col] / df[dmin_col]
+        if "Nanorod aspect ratio (L/W)" in df.columns:
+            ar = df["Nanorod aspect ratio (L/W)"]
+        else:
+            dmax_col = [c for c in df.columns if "Dₘₐₓ" in c][0]
+            dmin_col = [c for c in df.columns if "Dₘᵢₙ" in c][0]
+            ar = df[dmax_col] / df[dmin_col]
         return {
             "mean": float(ar.mean()),
             "median": float(ar.median()),

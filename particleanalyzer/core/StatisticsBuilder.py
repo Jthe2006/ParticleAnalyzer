@@ -38,33 +38,40 @@ class StatisticsBuilder:
             "e": "e",
             "I": f'I [{self._get_translation("ед.")}]',
         }
+        metric_columns = list(col_map.values())
+        optional_shape_columns = [
+            "Circularity",
+            "Axis ratio",
+            "Rod length [{}]".format(unit),
+            "Rod width [{}]".format(unit),
+            "Nanorod aspect ratio (L/W)",
+            "ISO Feret ratio (min/max)",
+            "Rod orientation [°]",
+        ]
+        metric_columns.extend(
+            column for column in optional_shape_columns if column in self.df.columns
+        )
         stats = {
-            self._get_translation("Параметр"): [
-                col_map["D"],
-                col_map["Dₘₐₓ"],
-                col_map["Dₘᵢₙ"],
-                col_map["Dₘₑₐₙ"],
-                col_map["θₘₐₓ"],
-                col_map["θₘᵢₙ"],
-                col_map["S"],
-                col_map["P"],
-                "e",
-                col_map["I"],
-            ],
+            self._get_translation("Параметр"): metric_columns,
             self._get_translation("Среднее"): [
-                round(self.df[col_map[k]].mean(), self.round_value) for k in col_map
+                round(self.df[column].mean(), self.round_value)
+                for column in metric_columns
             ],
             self._get_translation("Медиана"): [
-                round(self.df[col_map[k]].median(), self.round_value) for k in col_map
+                round(self.df[column].median(), self.round_value)
+                for column in metric_columns
             ],
             self._get_translation("Максимум"): [
-                round(self.df[col_map[k]].max(), self.round_value) for k in col_map
+                round(self.df[column].max(), self.round_value)
+                for column in metric_columns
             ],
             self._get_translation("Минимум"): [
-                round(self.df[col_map[k]].min(), self.round_value) for k in col_map
+                round(self.df[column].min(), self.round_value)
+                for column in metric_columns
             ],
             self._get_translation("СО"): [
-                round(self.df[col_map[k]].std(), self.round_value) for k in col_map
+                round(self.df[column].std(), self.round_value)
+                for column in metric_columns
             ],
         }
 
@@ -114,29 +121,39 @@ class StatisticsBuilder:
         if self.df.empty:
             return None, None
 
-        row_heights = [0.2, 0.2, 0.2, 0.2, 0.2]
+        has_nanorod_metrics = {
+            "Nanorod aspect ratio (L/W)",
+            "ISO Feret ratio (min/max)",
+        }.issubset(self.df.columns)
+        row_count = 6 if has_nanorod_metrics else 5
+        row_heights = [1.0 / row_count] * row_count
+        subplot_titles = (
+            self._get_translation("Распределение диаметра"),
+            self._get_translation("Распределение диаметра Ферета"),
+            self._get_translation("Распределение диаметра Ферета"),
+            self._get_translation("Распределение диаметра Ферета"),
+            self._get_translation("Распределение угла Ферета"),
+            self._get_translation("Распределение угла Ферета"),
+            self._get_translation("Распределение площади"),
+            self._get_translation("Распределение периметра"),
+            self._get_translation("Распределение эксцентриситета"),
+            self._get_translation("Распределение интенсивности"),
+        )
+        if has_nanorod_metrics:
+            subplot_titles += (
+                self._get_translation(
+                    "Nanorod aspect ratio (L/W) distribution"
+                ),
+                self._get_translation("ISO Feret ratio (min/max) distribution"),
+            )
         fig = make_subplots(
-            rows=5,
+            rows=row_count,
             cols=2,
             row_heights=row_heights,
-            subplot_titles=(
-                self._get_translation("Распределение диаметра"),
-                self._get_translation("Распределение диаметра Ферета"),
-                self._get_translation("Распределение диаметра Ферета"),
-                self._get_translation("Распределение диаметра Ферета"),
-                self._get_translation("Распределение угла Ферета"),
-                self._get_translation("Распределение угла Ферета"),
-                self._get_translation("Распределение площади"),
-                self._get_translation("Распределение периметра"),
-                self._get_translation("Распределение эксцентриситета"),
-                self._get_translation("Распределение интенсивности"),
-            ),
+            subplot_titles=subplot_titles,
             specs=[
-                [{"secondary_y": True}, {"secondary_y": True}],
-                [{"secondary_y": True}, {"secondary_y": True}],
-                [{"secondary_y": True}, {"secondary_y": True}],
-                [{"secondary_y": True}, {"secondary_y": True}],
-                [{"secondary_y": True}, {"secondary_y": True}],
+                [{"secondary_y": True}, {"secondary_y": True}]
+                for _ in range(row_count)
             ],
             vertical_spacing=0.07,
             horizontal_spacing=0.11,
@@ -160,6 +177,25 @@ class StatisticsBuilder:
             (5, 1, "e", self._get_translation("Эксцентриситет"), "magenta"),
             (5, 2, "I", self._get_translation("Интенсивность"), "cyan"),
         ]
+        if has_nanorod_metrics:
+            base_params.extend(
+                [
+                    (
+                        6,
+                        1,
+                        "Nanorod aspect ratio (L/W)",
+                        self._get_translation("Nanorod aspect ratio (L/W)"),
+                        "darkviolet",
+                    ),
+                    (
+                        6,
+                        2,
+                        "ISO Feret ratio (min/max)",
+                        self._get_translation("ISO Feret ratio (min/max)"),
+                        "teal",
+                    ),
+                ]
+            )
 
         unit = self._get_translation(self.scale_selector["unit"])
 
@@ -177,9 +213,10 @@ class StatisticsBuilder:
                 unit_format = ""
 
             full_param_name = self._get_translation(full_name) + unit_format
-            short_param_name = (
-                self._get_translation(short_name) if short_name != "e" else "e"
-            ) + unit_format
+            # DataFrame column identifiers are language-neutral. Translate only
+            # the human-readable plot label; translating the lookup key causes
+            # KeyError in Chinese and other non-English interfaces.
+            short_param_name = short_name + unit_format
 
             params.append((row, col, short_param_name, full_param_name, color))
 
@@ -190,7 +227,7 @@ class StatisticsBuilder:
             )
 
         fig.update_layout(
-            height=1150,
+            height=1380 if has_nanorod_metrics else 1150,
             plot_bgcolor="white",
             margin=dict(l=50, r=50, b=50, t=50),
             modebar={

@@ -2,9 +2,11 @@ import json
 from typing import Dict, List, Tuple, Literal
 import pandas as pd
 import numpy as np
+import gradio as gr
 from openai import OpenAI
 from huggingface_hub import InferenceClient
-from particleanalyzer.core.language_context import LanguageContext
+from particleanalyzer.core.language_context import LanguageContext, resolve_language
+from particleanalyzer.core.languages import translations
 
 
 class LLMAnalysis:
@@ -101,27 +103,48 @@ class LLMAnalysis:
             "histogram": self._create_histogram(circ, num_bins),
         }
 
-    def analyze(self, df: pd.DataFrame, model_llm: str) -> List[Tuple[None, str]]:
+    def analyze(
+        self,
+        df: pd.DataFrame,
+        model_llm: str,
+        request: gr.Request | None = None,
+        selected_language: str = "auto",
+    ) -> List[Tuple[None, str]]:
         """Анализирует DataFrame с частицами и возвращает результаты LLM"""
-        self.lang = LanguageContext.get_language()
+        lang = resolve_language(
+            selected_language,
+            request.headers.get("Accept-Language", "")
+            if request is not None
+            else "",
+            fallback="en",
+        )
+        LanguageContext.set_language(lang)
 
         if df.empty:
-            return [{"role": "assistant", "content": "No particles detected"}]
+            return [
+                {
+                    "role": "assistant",
+                    "content": translations[lang]["No particles detected"],
+                }
+            ]
 
         # Вычисляем статистику
         stats = self._calculate_stats(df)
         count_particles = len(df)
 
         try:
-            prompt = self._build_prompt(stats, count_particles)
+            prompt = self._build_prompt(stats, count_particles, lang)
             self.model = model_llm
             response = self._get_llm_response(prompt)
             return self._format_response(response)
         except Exception as e:
             print(f"LLM analysis failed: {str(e)}")
-            return [{"role": "assistant", "content": f"Analysis error: {str(e)}"}]
+            error_label = translations[lang]["Analysis error"]
+            return [
+                {"role": "assistant", "content": f"{error_label}: {str(e)}"}
+            ]
 
-    def _build_prompt(self, stats, count_particles) -> str:
+    def _build_prompt(self, stats, count_particles, lang) -> str:
         return f"""
         Ты — ведущий эксперт в материаловедении и сканирующей электронной микроскопии (СЭМ) с 15-летним стажем. 
         Твоя задача — подготовить развёрнутый экспертный отчёт по характеристикам {count_particles} частиц.
@@ -140,7 +163,7 @@ class LLMAnalysis:
         3. **Ориентация** — направленность
         4. **Проблемные зоны** — участки с сомнительными измерениями
 
-        ✍️ **Формат отчёта (язык: {self.lang})** — без лишних отступов, используй маркированные списки и смайлики-иконки:
+        ✍️ **Формат отчёта (язык: {lang})** — без лишних отступов, используй маркированные списки и смайлики-иконки:
         
         🌡️ **Размерные характеристики**:
         - **Размер**: <диаметр, диапазоны, преобладающие фракции>  

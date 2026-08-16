@@ -6,7 +6,12 @@ import csv
 import os
 from datetime import datetime
 from particleanalyzer.core.languages import translations
-from particleanalyzer.core.language_context import LanguageContext
+from particleanalyzer.core.language_context import (
+    LanguageContext,
+    SUPPORTED_LANGUAGE_CODES,
+    normalize_language_code,
+    resolve_language,
+)
 from particleanalyzer.core.ParticleAnalyzer import ParticleAnalyzer
 from particleanalyzer.core.StatisticsBuilder import StatisticsBuilder
 from particleanalyzer.core.ImagePreprocessor import ImagePreprocessor
@@ -19,22 +24,176 @@ def assets_path(name: str):
 
 def determine_language(accept_language: str):
     """Определение языка на основе заголовка Accept-Language"""
-    if not accept_language:
-        return "en"
+    return resolve_language("auto", accept_language, fallback="en")
 
-    lang_code = accept_language.split(",")[0].lower()
 
-    language_mapping = {
-        "en-us": "en",
+def _request_accept_language(request: gr.Request | None) -> str:
+    if request is None:
+        return ""
+    return request.headers.get("Accept-Language", "")
+
+
+def activate_interface_language(
+    selected_language, resolved_language, _saved_preference=None
+):
+    """Keep backend-generated results in the language selected by this session."""
+
+    normalized_preference = normalize_language_code(selected_language)
+    preference = {
         "en": "en",
         "ru": "ru",
-        "zh-cn": "zh-cn",
-        "zh-tw": "zh-tw",
+        "zh-cn": "zh-CN",
+        "zh-tw": "zh-TW",
+        "auto": "auto",
+    }.get(normalized_preference, "auto")
+    concrete_language = normalize_language_code(resolved_language)
+    if concrete_language not in SUPPORTED_LANGUAGE_CODES:
+        concrete_language = "en"
+    LanguageContext.set_language(concrete_language)
+    language_choices = [
+        (
+            translations[concrete_language].get(
+                "Automatic / Browser", "Automatic / Browser"
+            ),
+            "auto",
+        ),
+        ("English", "en"),
+        ("Русский", "ru"),
+        ("简体中文", "zh-CN"),
+        ("繁體中文", "zh-TW"),
+    ]
+    return (
+        preference,
+        concrete_language,
+        gr.update(value=preference, choices=language_choices),
+    )
+
+
+# Gradio 5.50 exposes its locale setter from the loaded init module but does not
+# provide a public Python hook for an in-app language control.  The dependency is
+# pinned to 5.50.0, and this adapter discovers the hashed asset URL at runtime so
+# app labels and Gradio's own controls switch together without a page reload.
+switchLanguage = r"""
+async (selectedLanguage, previousResolvedLanguage, savedPreference) => {
+    const normalizeLocale = (value) => {
+        const language = String(value || "").replace("_", "-").toLowerCase();
+        const subtags = language.split("-");
+        if (subtags[0] === "en") return "en";
+        if (language === "ru" || language.startsWith("ru-")) return "ru";
+        if (subtags[0] === "zh") {
+            if (
+                subtags.includes("hant") ||
+                ["tw", "hk", "mo"].some((region) => subtags.includes(region))
+            ) return "zh-TW";
+            return "zh-CN";
+        }
+        return null;
+    };
+
+    const browserLanguages = Array.isArray(navigator.languages)
+        ? navigator.languages
+        : [navigator.language];
+    const automaticLocale = browserLanguages
+        .map(normalizeLocale)
+        .find((language) => language !== null) || "en";
+    const locale = selectedLanguage === "auto"
+        ? automaticLocale
+        : normalizeLocale(selectedLanguage) || "en";
+    const switchViaGradioSettings = async () => {
+        const nativeNames = {
+            en: "English",
+            ru: "Русский",
+            "zh-CN": "简体中文",
+            "zh-TW": "繁體中文",
+        };
+        const waitFor = (finder, timeoutMs = 3000) => new Promise(
+            (resolve, reject) => {
+                const deadline = Date.now() + timeoutMs;
+                const timer = setInterval(() => {
+                    const value = finder();
+                    if (value) {
+                        clearInterval(timer);
+                        resolve(value);
+                    } else if (Date.now() > deadline) {
+                        clearInterval(timer);
+                        reject(new Error("Gradio language control timed out"));
+                    }
+                }, 25);
+            }
+        );
+        let input = document.querySelector(
+            '.api-docs-wrap input[role="listbox"][aria-label="Language"]'
+        );
+        if (!input) {
+            const settingsButton = document.querySelector("footer button.settings");
+            if (!settingsButton) throw new Error("Gradio settings button was not found");
+            settingsButton.dispatchEvent(
+                new MouseEvent("mouseenter", { bubbles: true })
+            );
+            settingsButton.click();
+            input = await waitFor(() => document.querySelector(
+                '.api-docs-wrap input[role="listbox"][aria-label="Language"]'
+            ));
+        }
+        input.focus();
+        const option = await waitFor(() => Array.from(document.querySelectorAll(
+            'li[data-testid="dropdown-option"][role="option"]'
+        )).find((element) =>
+            element.getAttribute("aria-label") === nativeNames[locale]
+        ));
+        option.dispatchEvent(new MouseEvent("mousedown", {
+            bubbles: true,
+            cancelable: true,
+        }));
+        await new Promise(requestAnimationFrame);
+        input.closest(".api-docs")?.querySelector(".backdrop")?.click();
+    };
+    const resourceUrls = [
+        ...performance.getEntriesByType("resource").map((entry) => entry.name),
+        ...Array.from(document.querySelectorAll("script[src], link[href]"))
+            .map((element) => element.src || element.href),
+    ];
+    const initUrl = resourceUrls.find((url) =>
+        /\/assets\/init-[^/?]+\.js(?:\?|$)/.test(url)
+    );
+
+    try {
+        if (!initUrl) throw new Error("Gradio locale module was not found");
+        const localeModule = await import(initUrl);
+        if (typeof localeModule.e !== "function") {
+            throw new Error("Gradio locale setter is unavailable");
+        }
+        await localeModule.e(locale);
+    } catch (error) {
+        console.warn("Direct Gradio language switch failed; using settings", error);
+        try {
+            await switchViaGradioSettings();
+        } catch (fallbackError) {
+            console.error("ParticleAnalyzer language switch failed", fallbackError);
+            window.alert(
+                "Unable to switch the interface language. " +
+                "The previous language will be restored."
+            );
+            if (savedPreference === undefined) {
+                return [
+                    selectedLanguage || "auto",
+                    previousResolvedLanguage || "en",
+                ];
+            }
+            return [
+                savedPreference || "auto",
+                previousResolvedLanguage || "en",
+                savedPreference || "auto",
+            ];
+        }
     }
 
-    return language_mapping.get(
-        lang_code, language_mapping.get(lang_code.split("-")[0], "en")
-    )
+    if (savedPreference === undefined) {
+        return [selectedLanguage, locale];
+    }
+    return [selectedLanguage, locale, savedPreference];
+}
+"""
 
 
 def get_translation(text):
@@ -42,7 +201,16 @@ def get_translation(text):
     return translations.get(lang, {}).get(text, text)
 
 
-def translate_chatbot():
+def translate_chatbot(
+    selected_language="auto", request: gr.Request | None = None
+):
+    LanguageContext.set_language(
+        resolve_language(
+            selected_language,
+            _request_accept_language(request),
+            fallback="en",
+        )
+    )
     text_chatbot = get_translation(
         """🔬 **Добро пожаловать в систему анализа SEM-изображений!**
         Я – ваш виртуальный ассистент в сканирующей электронной микроскопии. Готов провести детальный анализ морфологии и размерных характеристик частиц."""
@@ -82,8 +250,17 @@ def get_stats_columns():
     return pd.DataFrame(columns=columns)
 
 
-def scale_input_visibility(scale_value):
+def scale_input_visibility(
+    scale_value, selected_language="auto", request: gr.Request | None = None
+):
     """Показываем масштабную шкалу"""
+    LanguageContext.set_language(
+        resolve_language(
+            selected_language,
+            _request_accept_language(request),
+            fallback="en",
+        )
+    )
     is_scaled = ParticleAnalyzer.SCALE_OPTIONS[scale_value]["scale"]
     return (
         gr.update(visible=(is_scaled)),
@@ -110,8 +287,14 @@ def sahi_mode_visibility(sahi_mode):
     )
 
 
-def reset_interface():
+def reset_interface(selected_language="auto", request: gr.Request | None = None):
     """Функция для сброса интерфейса"""
+    accept_language = (
+        request.headers.get("Accept-Language", "") if request is not None else ""
+    )
+    LanguageContext.set_language(
+        resolve_language(selected_language, accept_language, fallback="en")
+    )
     global selected_particles
     selected_particles = []
     return (
@@ -154,9 +337,17 @@ def reset_interface2():
     )
 
 
-def scale_input_unit_measurement(scale_selector, request: gr.Request):
+def scale_input_unit_measurement(
+    scale_selector,
+    request: gr.Request | None = None,
+    selected_language="auto",
+):
     """Установка лейбла для длины шкалы прибора"""
-    lang = determine_language(request.headers.get("Accept-Language", ""))
+    lang = resolve_language(
+        selected_language,
+        _request_accept_language(request),
+        fallback="en",
+    )
     LanguageContext.set_language(lang)
     unit = ParticleAnalyzer.SCALE_OPTIONS[scale_selector]["unit"]
     label = get_translation(f"Длина шкалы в {unit}")
@@ -261,10 +452,19 @@ def statistic_an(
     fill_color,
     fill_alpha,
     min_nanorod_aspect_ratio,
+    selected_language="auto",
+    request: gr.Request | None = None,
 ):
 
     if in_image is None:
         return None, None, None, None, None
+
+    accept_language = (
+        request.headers.get("Accept-Language", "") if request is not None else ""
+    )
+    LanguageContext.set_language(
+        resolve_language(selected_language, accept_language, fallback="en")
+    )
 
     # Slider/style events can be dispatched while the main analysis callback is
     # still publishing its outputs.  In that short window the image and particle
@@ -439,8 +639,21 @@ def reset_selection(output_table_image2):
 
 
 def particle_removal(
-    output_table_image2, points_df, output_table, round_value, scale_selector
+    output_table_image2,
+    points_df,
+    output_table,
+    round_value,
+    scale_selector,
+    selected_language="auto",
+    request: gr.Request | None = None,
 ):
+    LanguageContext.set_language(
+        resolve_language(
+            selected_language,
+            _request_accept_language(request),
+            fallback="en",
+        )
+    )
     global selected_particles
     if not output_table_image2.empty and "№" in output_table_image2.columns:
         try:

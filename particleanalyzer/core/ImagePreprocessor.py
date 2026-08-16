@@ -27,8 +27,8 @@ class ImagePreprocessor:
         self.lang = lang
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def _get_translation(self, text):
-        return translations.get(self.lang, {}).get(text, text)
+    def _get_translation(self, text, lang=None):
+        return translations.get(lang or self.lang, {}).get(text, text)
 
     def preprocess_image(
         self,
@@ -43,14 +43,19 @@ class ImagePreprocessor:
         lang: str,
     ):
         """Основной метод предварительной обработки изображения."""
-        self.lang = lang
-        pbar.set_description(self._get_translation("Загрузка изображения..."))
-        pr(0.25, desc=self._get_translation("Загрузка изображения..."))
+        pbar.set_description(
+            self._get_translation("Загрузка изображения...", lang)
+        )
+        pr(
+            0.25,
+            desc=self._get_translation("Загрузка изображения...", lang),
+        )
         try:
             if scale_selector["scale"] and scale is None:
                 gr.Info(
                     self._get_translation(
-                        "Обозначьте на изображении масштабную шкалу при помощи двух точек."
+                        "Обозначьте на изображении масштабную шкалу при помощи двух точек.",
+                        lang,
                     )
                 )
                 return None, None, None, None, None, None

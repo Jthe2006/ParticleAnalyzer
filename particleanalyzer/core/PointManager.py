@@ -2,7 +2,7 @@ import numpy as np
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFont
 from particleanalyzer.core.languages import translations
-from particleanalyzer.core.language_context import LanguageContext
+from particleanalyzer.core.language_context import LanguageContext, resolve_language
 
 
 class PointManager:
@@ -11,7 +11,8 @@ class PointManager:
         self.lang = lang
 
     def _get_translation(self, text):
-        return translations.get(self.lang, {}).get(text, text)
+        lang = LanguageContext.get_language()
+        return translations.get(lang, {}).get(text, text)
 
     def add_point(self, point):
         if len(self.points) >= 2:
@@ -24,9 +25,25 @@ class PointManager:
         self.points = []
         return self.points
 
-    def handle_select(self, scale_selector, DataMeasurement: gr.EventData):
+    def handle_select(
+        self,
+        scale_selector,
+        DataMeasurement: gr.EventData,
+        request: gr.Request | None = None,
+        selected_language="auto",
+    ):
         DataMeasurement = DataMeasurement._data
-        self.lang = LanguageContext.get_language()
+        accept_language = (
+            request.headers.get("Accept-Language", "")
+            if request is not None
+            else ""
+        )
+        lang = resolve_language(
+            selected_language,
+            accept_language,
+            fallback="en",
+        )
+        LanguageContext.set_language(lang)
 
         return (
             f"{self._get_translation('Расстояние равно')}: {DataMeasurement['distance_px']:.0f} {self._get_translation('пикселей')}",

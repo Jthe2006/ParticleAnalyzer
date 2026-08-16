@@ -28,7 +28,7 @@ from particleanalyzer.core.ModelManager import ModelManager
 from particleanalyzer.core.ImagePreprocessor import ImagePreprocessor
 from particleanalyzer.core.StatisticsBuilder import StatisticsBuilder
 from particleanalyzer.core.languages import translations
-from particleanalyzer.core.language_context import LanguageContext
+from particleanalyzer.core.language_context import LanguageContext, resolve_language
 from particleanalyzer.core.PointManager import PointManager
 from particleanalyzer.core.EnhancementPipeline import EnhancementPipeline
 from particleanalyzer.core.ScaleProcessor import ScaleProcessor
@@ -120,7 +120,8 @@ class ParticleAnalyzer:
 
     def _get_translation(self, text):
         """Получение перевода текста на текущий язык"""
-        return translations.get(self.lang, translations[self.default_lang]).get(
+        lang = LanguageContext.get_language()
+        return translations.get(lang, translations[self.default_lang]).get(
             text, text
         )
 
@@ -204,14 +205,18 @@ class ParticleAnalyzer:
         pipelines_enhancer: str,
         api_key: bool,
         request: gr.Request,
+        selected_language: str = "auto",
         pr=gr.Progress(),
     ) -> Tuple:
         """
         Основной метод для анализа изображения.
         """
-        lang = self._determine_language(request.headers.get("Accept-Language", ""))
+        lang = resolve_language(
+            selected_language,
+            request.headers.get("Accept-Language", ""),
+            fallback=self.default_lang,
+        )
         LanguageContext.set_language(lang)
-        self.lang = lang  # Для обратной совместимости
         scale_selector = self.__class__.SCALE_OPTIONS[scale_selector]
         try:
             pbar = tqdm(
@@ -237,7 +242,7 @@ class ParticleAnalyzer:
                     pbar=pbar,
                     pr=pr,
                     sahi_mode=sahi_mode,
-                    lang=self.lang,
+                    lang=lang,
                 )
             )
             if pipelines_enhancer:
@@ -280,6 +285,7 @@ class ParticleAnalyzer:
                 "fill_type_color": fill_type_color,
                 "fill_color": fill_color,
                 "fill_alpha": fill_alpha,
+                "lang": lang,
             }
 
             # Выбор стратегии обработки
@@ -327,7 +333,7 @@ class ParticleAnalyzer:
                 scale_selector,
                 round_value=round_value,
                 number_of_bins=number_of_bins,
-                lang=self.lang,
+                lang=lang,
             )
             stats_df = builder.build_stats_table()
 
@@ -342,7 +348,7 @@ class ParticleAnalyzer:
                 df,
                 number_of_bins=number_of_bins,
                 min_aspect_ratio=min_nanorod_aspect_ratio,
-                lang=self.lang,
+                lang=lang,
             )
             pbar.update(1)
 
@@ -700,6 +706,9 @@ class ParticleAnalyzer:
 
     def _analyze_particle(self, **config) -> int:
         """Анализ отдельной частицы с расчетом Feret-диаметров"""
+        LanguageContext.set_language(
+            config.get("lang", getattr(self, "lang", self.default_lang))
+        )
         if len(config["points"]) < 3:
             return config["particle_counter"]
 
@@ -1099,7 +1108,12 @@ class ParticleAnalyzer:
             return None
 
     def handle_file_upload(
-        self, file, scale_selector, auto_scale_mode, request: gr.Request
+        self,
+        file,
+        scale_selector,
+        auto_scale_mode,
+        request: gr.Request,
+        selected_language="auto",
     ):
         # Быстрая проверка на None файл
         if file is None:
@@ -1116,9 +1130,12 @@ class ParticleAnalyzer:
             )
 
         # Установка языка
-        lang = self._determine_language(request.headers.get("Accept-Language", ""))
+        lang = resolve_language(
+            selected_language,
+            request.headers.get("Accept-Language", ""),
+            fallback=self.default_lang,
+        )
         LanguageContext.set_language(lang)
-        self.lang = lang
         
         ImagePreprocessor.file_name = os.path.basename(file.name).rsplit('.', 1)[0]
         

@@ -20,6 +20,8 @@ from particleanalyzer.core.utils import (
     particle_removal,
     reset_selection,
     sahi_row_visibility,
+    activate_interface_language,
+    switchLanguage,
 )
 from particleanalyzer.core.about import about_ru
 from particleanalyzer.core.parameter_information import reference_ru
@@ -92,6 +94,12 @@ def create_interface(api_key):
         scale = gr.State()
         points_scale = gr.State()
         image_name = gr.State()
+        language_preference = gr.BrowserState(
+            default_value="auto",
+            storage_key="particleanalyzer-interface-language",
+            secret="particleanalyzer-language-v1",
+        )
+        resolved_language = gr.State("en")
 
         with gr.Column(elem_id="app-container"):
             with gr.Row(equal_height=True, elem_id="gr-head"):
@@ -220,7 +228,7 @@ def create_interface(api_key):
                                             label=i18n("Статус калибровки масштаба"),
                                         )
                                         scale_input = gr.Number(
-                                            label="Длина шкалы в мкм",
+                                            label=i18n("Длина шкалы в мкм"),
                                             value=1.0,
                                             elem_id="scale-input",
                                         )
@@ -391,6 +399,27 @@ def create_interface(api_key):
                                             )
 
                 with gr.Tab(i18n("Настройки"), elem_id="setting"):
+                    with gr.Group(elem_id="language-setting"):
+                        gr.Markdown(
+                            f"<h3 style='margin-left: 7px;'><i class='fas fa-language'></i> {i18n('Language settings')}</h3>"
+                        )
+                        with gr.Row():
+                            language_selector = gr.Dropdown(
+                                choices=[
+                                    ("Automatic / Browser", "auto"),
+                                    ("English", "en"),
+                                    ("Русский", "ru"),
+                                    ("简体中文", "zh-CN"),
+                                    ("繁體中文", "zh-TW"),
+                                ],
+                                value="auto",
+                                label=i18n("Interface language"),
+                                info=i18n(
+                                    "Switches interface labels and future analysis results."
+                                ),
+                                filterable=False,
+                                elem_id="language-selector",
+                            )
                     with gr.Group(elem_id="model-setting"):
                         gr.Markdown(
                             f"<h3 style='margin-left: 7px;'><i class='fas fa-search'></i> {i18n('Настройки обнаружения')}</h3>"
@@ -654,9 +683,44 @@ def create_interface(api_key):
                         label=f"I [{i18n('ед.')}]",
                     )
 
+        demo.load(
+            fn=activate_interface_language,
+            inputs=[language_preference, resolved_language],
+            outputs=[
+                language_preference,
+                resolved_language,
+                language_selector,
+            ],
+            js=switchLanguage,
+            queue=False,
+            show_progress="hidden",
+        )
+
+        language_selector.input(
+            fn=activate_interface_language,
+            inputs=[
+                language_selector,
+                resolved_language,
+                language_preference,
+            ],
+            outputs=[
+                language_preference,
+                resolved_language,
+                language_selector,
+            ],
+            js=switchLanguage,
+            queue=False,
+            show_progress="hidden",
+        )
+
         image_file.change(
             fn=analyzer.handle_file_upload,
-            inputs=[image_file, scale_selector, auto_scale_mode],
+            inputs=[
+                image_file,
+                scale_selector,
+                auto_scale_mode,
+                resolved_language,
+            ],
             outputs=[
                 in_image,
                 row_image_file,
@@ -673,7 +737,7 @@ def create_interface(api_key):
 
         in_image.measurement(
             fn=point_manager.handle_select,
-            inputs=scale_selector,
+            inputs=[scale_selector, resolved_language],
             outputs=[scale_input_status, scale, points_scale],
         )
 
@@ -713,6 +777,7 @@ def create_interface(api_key):
                 fill_alpha,
                 pipelines_enhancer,
                 api_key,
+                resolved_language,
             ],
             outputs=[
                 output_image,
@@ -749,7 +814,9 @@ def create_interface(api_key):
             ],
         )
 
-        process_button.click(translate_chatbot, None, chatbot)
+        process_button.click(
+            translate_chatbot, [resolved_language], chatbot
+        )
         
         delete_row.click(
             particle_removal,
@@ -759,6 +826,7 @@ def create_interface(api_key):
                 output_table,
                 round_value,
                 scale_selector,
+                resolved_language,
             ],
             outputs=[
                 output_table_image2_row,
@@ -802,6 +870,7 @@ def create_interface(api_key):
                 fill_color,
                 fill_alpha,
                 min_nanorod_aspect_ratio,
+                resolved_language,
             ],
             outputs=[
                 output_image,
@@ -865,6 +934,7 @@ def create_interface(api_key):
                 fill_color,
                 fill_alpha,
                 min_nanorod_aspect_ratio,
+                resolved_language,
             ],
             outputs=[
                 output_image,
@@ -877,14 +947,14 @@ def create_interface(api_key):
 
         llm_start = llm_run.click(
             fn=llm_amalysis.analyze,
-            inputs=[output_table, model_llm],
+            inputs=[output_table, model_llm, resolved_language],
             outputs=[chatbot],
         )
         cancel_llm_button.click(None, None, None, cancels=[llm_start])
 
         scale_selector.change(
             scale_input_visibility,
-            inputs=scale_selector,
+            inputs=[scale_selector, resolved_language],
             outputs=[
                 scale_input_row,
                 output_table,
@@ -921,6 +991,7 @@ def create_interface(api_key):
         gr.on(
             triggers=[clear_button.click, in_image.clear],
             fn=reset_interface,
+            inputs=[resolved_language],
             outputs=[
                 output_image,
                 output_plot,
@@ -965,7 +1036,7 @@ def create_interface(api_key):
 
         scale_selector.change(
             fn=scale_input_unit_measurement,
-            inputs=[scale_selector],
+            inputs=[scale_selector, resolved_language],
             outputs=[scale_input],
             show_progress="hide",
             show_progress_on=question_row,

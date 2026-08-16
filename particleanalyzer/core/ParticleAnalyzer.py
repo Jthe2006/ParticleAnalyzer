@@ -33,6 +33,10 @@ from particleanalyzer.core.language_context import LanguageContext
 from particleanalyzer.core.PointManager import PointManager
 from particleanalyzer.core.EnhancementPipeline import EnhancementPipeline
 from particleanalyzer.core.ScaleProcessor import ScaleProcessor
+from particleanalyzer.core.shape_filter import (
+    calculate_shape_metrics,
+    passes_shape_filter,
+)
 
 lang = "en"
 
@@ -177,6 +181,9 @@ class ParticleAnalyzer:
         overlap_width_ratio: float,
         sahi_mode: bool,
         number_of_bins: int,
+        spherical_filter_enabled: bool,
+        min_circularity: float,
+        min_axis_ratio: float,
         show_Feret_diametr: bool,
         show_Scale_bar: bool,
         outline_color,
@@ -251,6 +258,9 @@ class ParticleAnalyzer:
                 "gray_image": gray_image,
                 "scale": scale,
                 "scale_factor_glob": scale_factor_glob,
+                "spherical_filter_enabled": spherical_filter_enabled,
+                "min_circularity": min_circularity,
+                "min_axis_ratio": min_axis_ratio,
                 "show_Feret_diametr": show_Feret_diametr,
                 "outline_color": outline_color,
                 "show_fillPoly": show_fillPoly,
@@ -266,6 +276,15 @@ class ParticleAnalyzer:
             output_image, particle_data, annotations = processor(**config)
 
             if output_image is None and particle_data is None and annotations is None:
+                self._cleanup(pbar)
+                return self._create_error_return()
+
+            if not particle_data:
+                gr.Info(
+                    self._get_translation(
+                        "No particles matched the 2D shape filter. Lower the thresholds or disable the filter."
+                    )
+                )
                 self._cleanup(pbar)
                 return self._create_error_return()
 
@@ -707,6 +726,19 @@ class ParticleAnalyzer:
 
         feret_max, feret_min, feret_mean, angle_max, angle_min = get_feret(points)
 
+        shape_metrics = calculate_shape_metrics(
+            area=area,
+            perimeter=perimeter,
+            contour=points,
+        )
+        if not passes_shape_filter(
+            metrics=shape_metrics,
+            enabled=config["spherical_filter_enabled"],
+            min_circularity=config["min_circularity"],
+            min_axis_ratio=config["min_axis_ratio"],
+        ):
+            return config["particle_counter"]
+
         # Средняя интенсивность
         mask_img = np.zeros_like(config["gray_image"], dtype=np.uint8)
         cv2.fillPoly(mask_img, [points], 255)
@@ -798,6 +830,12 @@ class ParticleAnalyzer:
                 ),
                 "centroid_x": round(centroid_x, config["round_value"]),
                 "centroid_y": round(centroid_y, config["round_value"]),
+                "Circularity": round(
+                    shape_metrics.circularity, config["round_value"]
+                ),
+                "Axis ratio": round(
+                    shape_metrics.axis_ratio, config["round_value"]
+                ),
                 "points": points.tolist(),
             }
         )

@@ -196,6 +196,12 @@ https://github.com/user-attachments/assets/6548071a-3c83-4539-897a-6ebf175bec17
 
 - **Detection Threshold**: Confidence level (0-1)
 - **IOU Threshold**: Overlap threshold for NMS (0-1)
+- **2D Shape Filter**: Exclude non-circular particle projections before drawing,
+  statistics, COCO generation, and CSV/binary-mask export. The default criteria
+  are circularity >= 0.75 and moment-based minor/major axis ratio >= 0.80.
+  These values are adjustable, and the filter can be disabled. Because SEM/TEM
+  images are 2D projections, this is a sphericity proxy rather than proof of a
+  particle's 3D shape.
 - **Max Detections**: Maximum number of particles to detect
 - **Scaling Mode**: Pixel/µm unit selection
 - **Image Resolution**: Output resolution control

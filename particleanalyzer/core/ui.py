@@ -433,6 +433,33 @@ def create_interface(api_key):
                                 step=0.01,
                                 label=i18n("Перекрытие по ширине"),
                             )
+                    with gr.Group(elem_id="shape-filter-setting"):
+                        gr.Markdown(
+                            f"<h3 style='margin-left: 7px;'><i class='fas fa-circle'></i> {i18n('2D shape filtering')}</h3>"
+                        )
+                        with gr.Row():
+                            spherical_filter_enabled = gr.Checkbox(
+                                value=True,
+                                label=i18n("Keep near-circular particles only"),
+                                info=i18n(
+                                    "Uses circularity and axis ratio as a 2D proxy for sphericity."
+                                ),
+                            )
+                        with gr.Row() as spherical_filter_row:
+                            min_circularity = gr.Slider(
+                                minimum=0.0,
+                                maximum=1.0,
+                                value=0.75,
+                                step=0.01,
+                                label=i18n("Minimum circularity"),
+                            )
+                            min_axis_ratio = gr.Slider(
+                                minimum=0.0,
+                                maximum=1.0,
+                                value=0.80,
+                                step=0.01,
+                                label=i18n("Minimum axis ratio (minor/major)"),
+                            )
                     with gr.Group():
                         gr.Markdown(
                             f"<h3 style='margin-left: 7px;'><i class='fas fa-sliders-h'></i> {i18n('Основные параметры')}</h3>"
@@ -621,6 +648,9 @@ def create_interface(api_key):
                 overlap_width_ratio,
                 sahi_mode,
                 number_of_bins,
+                spherical_filter_enabled,
+                min_circularity,
+                min_axis_ratio,
                 show_Feret_diametr,
                 show_Scale_bar,
                 outline_color,
@@ -808,6 +838,13 @@ def create_interface(api_key):
             ],
             show_progress="hide",
             show_progress_on=slice_row,
+        )
+
+        spherical_filter_enabled.change(
+            lambda enabled: gr.update(visible=enabled),
+            inputs=spherical_filter_enabled,
+            outputs=spherical_filter_row,
+            show_progress="hide",
         )
 
         gr.on(

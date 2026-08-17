@@ -205,8 +205,8 @@ class ParticleAnalyzer:
         pipelines_enhancer: str,
         api_key: bool,
         request: gr.Request,
-        selected_language: str = "auto",
         pr=gr.Progress(),
+        selected_language: str = "auto",
     ) -> Tuple:
         """
         Основной метод для анализа изображения.

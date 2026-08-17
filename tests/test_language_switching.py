@@ -10,6 +10,7 @@ from particleanalyzer.core.ImagePreprocessor import ImagePreprocessor
 from particleanalyzer.core.LLMAnalysis import LLMAnalysis
 from particleanalyzer.core.ParticleAnalyzer import ParticleAnalyzer
 from particleanalyzer.core.PointManager import PointManager
+from particleanalyzer.core.ui_styles import custom_head
 from particleanalyzer.core.languages import translations
 from particleanalyzer.core.language_context import (
     LanguageContext,
@@ -19,10 +20,12 @@ from particleanalyzer.core.language_context import (
 from particleanalyzer.core.utils import (
     activate_interface_language,
     particle_removal,
+    loadLanguagePreference,
+    prepareLanguageSelection,
+    reloadWithLanguage,
     scale_input_unit_measurement,
     scale_input_visibility,
     statistic_an,
-    switchLanguage,
     translate_chatbot,
 )
 
@@ -123,12 +126,13 @@ def test_interface_preference_updates_backend_context_and_returns_saved_value():
 
 def test_frontend_adapter_supports_every_interface_language():
     for language in ("en", "ru", "zh-CN", "zh-TW"):
-        assert language in switchLanguage
-    assert "localeModule.e" in switchLanguage
-    assert "switchViaGradioSettings" in switchLanguage
-    assert "navigator.languages" in switchLanguage
-    assert "previous language will be restored" in switchLanguage
-    assert "savedPreference" in switchLanguage
+        assert language in custom_head
+    assert "Object.defineProperty(navigator" in custom_head
+    assert "particleanalyzer-interface-preference-v1" in custom_head
+    assert "localStorage.getItem" in loadLanguagePreference
+    assert "resolveLocale" in prepareLanguageSelection
+    assert "localStorage.setItem" in reloadWithLanguage
+    assert "window.location.reload" in reloadWithLanguage
 
 
 def test_preprocessor_translation_does_not_mutate_shared_language():
@@ -157,6 +161,11 @@ def test_preprocessor_translation_does_not_mutate_shared_language():
 )
 def test_language_argument_is_optional_for_existing_python_callers(callback):
     assert signature(callback).parameters["selected_language"].default == "auto"
+
+
+def test_analyze_image_preserves_progress_argument_position():
+    parameters = list(signature(ParticleAnalyzer.analyze_image).parameters)
+    assert parameters.index("pr") < parameters.index("selected_language")
 
 
 class _RussianRequest:

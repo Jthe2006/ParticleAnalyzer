@@ -21,7 +21,9 @@ from particleanalyzer.core.utils import (
     reset_selection,
     sahi_row_visibility,
     activate_interface_language,
-    switchLanguage,
+    loadLanguagePreference,
+    prepareLanguageSelection,
+    reloadWithLanguage,
 )
 from particleanalyzer.core.about import about_ru
 from particleanalyzer.core.parameter_information import reference_ru
@@ -94,12 +96,16 @@ def create_interface(api_key):
         scale = gr.State()
         points_scale = gr.State()
         image_name = gr.State()
-        language_preference = gr.BrowserState(
-            default_value="auto",
-            storage_key="particleanalyzer-interface-language",
-            secret="particleanalyzer-language-v1",
+        language_preference = gr.Textbox(
+            value="auto",
+            visible=False,
+            elem_id="interface-language-preference",
         )
-        resolved_language = gr.State("en")
+        resolved_language = gr.Textbox(
+            value="auto",
+            visible=False,
+            elem_id="resolved-interface-language",
+        )
 
         with gr.Column(elem_id="app-container"):
             with gr.Row(equal_height=True, elem_id="gr-head"):
@@ -415,7 +421,7 @@ def create_interface(api_key):
                                 value="auto",
                                 label=i18n("Interface language"),
                                 info=i18n(
-                                    "Switches interface labels and future analysis results."
+                                    "Switches interface labels and future analysis results. The page reloads."
                                 ),
                                 filterable=False,
                                 elem_id="language-selector",
@@ -691,12 +697,12 @@ def create_interface(api_key):
                 resolved_language,
                 language_selector,
             ],
-            js=switchLanguage,
+            js=loadLanguagePreference,
             queue=False,
             show_progress="hidden",
         )
 
-        language_selector.input(
+        language_change = language_selector.input(
             fn=activate_interface_language,
             inputs=[
                 language_selector,
@@ -708,7 +714,15 @@ def create_interface(api_key):
                 resolved_language,
                 language_selector,
             ],
-            js=switchLanguage,
+            js=prepareLanguageSelection,
+            queue=False,
+            show_progress="hidden",
+        )
+        language_change.success(
+            fn=None,
+            inputs=[language_preference, resolved_language],
+            outputs=None,
+            js=reloadWithLanguage,
             queue=False,
             show_progress="hidden",
         )

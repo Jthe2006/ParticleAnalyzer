@@ -463,6 +463,83 @@ footer {
 """
 
 custom_head = """
+<script>
+(() => {
+    const storageKey = "particleanalyzer-interface-preference-v1";
+    const normalizeLocale = (value) => {
+        const language = String(value || "").replace("_", "-").toLowerCase();
+        const subtags = language.split("-");
+        if (subtags[0] === "en") return "en";
+        if (subtags[0] === "ru") return "ru";
+        if (subtags[0] === "zh") {
+            if (
+                subtags.includes("hant") ||
+                ["tw", "hk", "mo"].some((region) => subtags.includes(region))
+            ) return "zh-TW";
+            return "zh-CN";
+        }
+        return null;
+    };
+    const normalizePreference = (value) => {
+        const raw = String(value || "auto").toLowerCase();
+        if (["auto", "browser", "system"].includes(raw)) return "auto";
+        return normalizeLocale(value) || "auto";
+    };
+    const browserLanguages = Array.isArray(navigator.languages)
+        ? [...navigator.languages]
+        : [navigator.language];
+    const automaticLocale = browserLanguages
+        .map(normalizeLocale)
+        .find((language) => language !== null) || "en";
+    const resolveLocale = (preference) => {
+        const normalizedPreference = normalizePreference(preference);
+        return normalizedPreference === "auto"
+            ? automaticLocale
+            : normalizedPreference;
+    };
+
+    let storedPreference = "auto";
+    try {
+        storedPreference = localStorage.getItem(storageKey) || "auto";
+    } catch (error) {
+        console.warn("ParticleAnalyzer language preference is unavailable", error);
+    }
+    const preference = normalizePreference(storedPreference);
+    const locale = resolveLocale(preference);
+
+    try {
+        Object.defineProperty(navigator, "language", {
+            configurable: true,
+            get: () => locale,
+        });
+        Object.defineProperty(navigator, "languages", {
+            configurable: true,
+            get: () => [locale],
+        });
+    } catch (error) {
+        console.warn("ParticleAnalyzer could not set the startup locale", error);
+    }
+    document.documentElement.lang = locale;
+    window.particleAnalyzerLanguage = {
+        storageKey,
+        normalizePreference,
+        resolveLocale,
+        preference,
+        locale,
+    };
+    const componentValues = {
+        "interface-language-preference": preference,
+        "resolved-interface-language": locale,
+    };
+    for (const component of window.gradio_config?.components || []) {
+        const componentId = component.props?.elem_id;
+        if (componentId in componentValues) {
+            component.props.value = componentValues[componentId];
+        }
+    }
+})();
+</script>
+
 <!-- HTML Meta Tags -->
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />

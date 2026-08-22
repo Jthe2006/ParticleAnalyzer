@@ -55,7 +55,7 @@ class EnhancementPipeline:
                 {
                     "method": "unsharp_mask",
                     "params": {
-                        "kernel_size": (2, 2),
+                        "kernel_size": (3, 3),
                         "sigma": 0.5,
                         "amount": 0.4,
                         "threshold": 3,
@@ -66,7 +66,7 @@ class EnhancementPipeline:
         "sem_low_quality_enhancement": {
             "description": "Для зашумленных/размытых SEM - агрессивное улучшение",
             "steps": [
-                {"method": "median_filter", "params": {"kernel_size": 2}},
+                {"method": "median_filter", "params": {"kernel_size": 3}},
                 {
                     "method": "nlm_denoise",
                     "params": {
@@ -103,7 +103,7 @@ class EnhancementPipeline:
                 {
                     "method": "unsharp_mask",
                     "params": {
-                        "kernel_size": (2, 2),
+                        "kernel_size": (3, 3),
                         "sigma": 0.3,
                         "amount": 1.8,
                         "threshold": 2,

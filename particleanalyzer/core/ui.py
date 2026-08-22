@@ -24,6 +24,13 @@ from particleanalyzer.core.utils import (
     loadLanguagePreference,
     prepareLanguageSelection,
     reloadWithLanguage,
+    initialize_manual_editor,
+    clear_manual_editor_session,
+    capture_analysis_edit_context,
+    begin_manual_contour,
+    manual_editor_add_vertex,
+    undo_manual_vertex,
+    clear_manual_draft,
 )
 from particleanalyzer.core.about import about_ru
 from particleanalyzer.core.parameter_information import reference_ru
@@ -93,6 +100,18 @@ def create_interface(api_key):
     with demo:
         api_key = gr.State(True if api_key else False)
         points_df = gr.State()
+        selected_particle_ids = gr.State([])
+        manual_draft_points = gr.State([])
+        manual_editor_base = gr.State()
+        manual_edit_action = gr.State("idle")
+        manual_add_action = gr.State("add")
+        manual_replace_action = gr.State("replace")
+        analysis_scale = gr.State()
+        analysis_scale_input = gr.State()
+        analysis_scale_selector = gr.State("Pixels")
+        analysis_solution = gr.State("Original")
+        analysis_sahi_mode = gr.State(False)
+        analysis_round_value = gr.State(4)
         scale = gr.State()
         points_scale = gr.State()
         image_name = gr.State()
@@ -194,6 +213,54 @@ def create_interface(api_key):
                                                 label=i18n("Результат сегментации"),
                                                 elem_id="output-image",
                                             )
+                                            with gr.Accordion(
+                                                i18n("Manual contour editor"),
+                                                open=False,
+                                                elem_id="manual-contour-editor",
+                                            ):
+                                                gr.Markdown(
+                                                    i18n(
+                                                        "Select a particle in the segmentation result before replacing or deleting it. For add or replace, click polygon vertices in order, then apply the contour."
+                                                    )
+                                                )
+                                                manual_editor_status = gr.Markdown(
+                                                    i18n(
+                                                        "Choose Add or Replace to begin drawing."
+                                                    )
+                                                )
+                                                manual_editor_image = gr.Image(
+                                                    label=i18n("Contour editing canvas"),
+                                                    type="numpy",
+                                                    interactive=False,
+                                                    show_download_button=False,
+                                                    elem_id="manual-editor-image",
+                                                )
+                                                with gr.Row():
+                                                    manual_add_mode = gr.Button(
+                                                        value=i18n("Add new contour")
+                                                    )
+                                                    manual_replace_mode = gr.Button(
+                                                        value=i18n(
+                                                            "Replace selected contour"
+                                                        )
+                                                    )
+                                                    manual_delete_button = gr.Button(
+                                                        value=i18n(
+                                                            "Delete selected particles"
+                                                        ),
+                                                        variant="stop",
+                                                    )
+                                                with gr.Row():
+                                                    manual_undo_point = gr.Button(
+                                                        value=i18n("Undo last point")
+                                                    )
+                                                    manual_clear_draft = gr.Button(
+                                                        value=i18n("Clear draft")
+                                                    )
+                                                    manual_apply_contour = gr.Button(
+                                                        value=i18n("Apply contour"),
+                                                        variant="primary",
+                                                    )
                                     with gr.Row(
                                         visible=False, elem_id="output-table-image2-row"
                                     ) as output_table_image2_row:
@@ -201,7 +268,7 @@ def create_interface(api_key):
                                             output_table_image2 = gr.Dataframe(
                                                 value=empty_df_ParticleCharacteristics,
                                                 label=i18n("Характеристики частицы"),
-                                                interactive=True,
+                                                interactive=False,
                                                 elem_id="dataframe-table",
                                                 show_copy_button=True,
                                             )
@@ -433,21 +500,21 @@ def create_interface(api_key):
                         with gr.Row():
                             model_change = gr.Dropdown(
                                 get_available_models(),
-                                value=get_available_models()[0],
+                                value=ParticleAnalyzer.DEFAULT_NANOROD_MODEL,
                                 label=i18n("Модель обнаружения"),
                             )
                         with gr.Row():
                             confidence_threshold = gr.Slider(
                                 minimum=0.0,
                                 maximum=1.0,
-                                value=0.5,
+                                value=ParticleAnalyzer.DEFAULT_NANOROD_CONFIDENCE,
                                 step=0.01,
                                 label=i18n("Точность обнаружения"),
                             )
                             confidence_iou = gr.Slider(
                                 minimum=0.0,
                                 maximum=1.0,
-                                value=0.7,
+                                value=ParticleAnalyzer.DEFAULT_NANOROD_IOU,
                                 step=0.01,
                                 label=i18n("Порог перекрытия (IoU)"),
                             )
@@ -537,11 +604,28 @@ def create_interface(api_key):
                                     "Length is the caliper span perpendicular to the minimum Feret width."
                                 ),
                             )
+                    with gr.Group(elem_id="border-qc-setting"):
+                        gr.Markdown(
+                            f"<h3 style='margin-left: 7px;'><i class='fas fa-crop-alt'></i> {i18n('Border quality control')}</h3>"
+                        )
+                        with gr.Row():
                             exclude_border_rods = gr.Checkbox(
                                 value=True,
-                                label=i18n("Exclude border-touching rods"),
+                                label=i18n("Exclude border-touching particles"),
                                 info=i18n(
-                                    "Recommended because clipped rods bias aspect-ratio statistics."
+                                    "Applied independently of shape mode. Border-clipped particles bias size and aspect-ratio measurements."
+                                ),
+                            )
+                    with gr.Group(elem_id="overlap-qc-setting"):
+                        gr.Markdown(
+                            f"<h3 style='margin-left: 7px;'><i class='fas fa-object-group'></i> {i18n('Overlap quality control')}</h3>"
+                        )
+                        with gr.Row():
+                            exclude_overlapping_rods = gr.Checkbox(
+                                value=True,
+                                label=i18n("Exclude likely merged/duplicate masks"),
+                                info=i18n(
+                                    "Applied independently of shape mode. Removes duplicate masks and unusually wide or irregular clusters; hidden particles are not reconstructed."
                                 ),
                             )
                     with gr.Group():
@@ -551,8 +635,13 @@ def create_interface(api_key):
                         with gr.Row(equal_height=True) as solution_and_segment_mode_row:
                             with gr.Column():
                                 solution = gr.Dropdown(
-                                    ("Original", "640x640", "1024x1024"),
-                                    value="1024x1024",
+                                    (
+                                        "Original",
+                                        "640x640",
+                                        "1024x1024",
+                                        "1280x1280",
+                                    ),
+                                    value=ParticleAnalyzer.DEFAULT_NANOROD_SOLUTION,
                                     label=i18n("Разрешение изображения"),
                                     elem_id="solution-setting",
                                 )
@@ -583,7 +672,7 @@ def create_interface(api_key):
                             with gr.Column(scale=1):
                                 pipelines_enhancer = gr.Dropdown(
                                     [None] + enhancement_pipelines,
-                                    value=None,
+                                    value=ParticleAnalyzer.DEFAULT_NANOROD_ENHANCEMENT,
                                     label=i18n("Улучшение изображения"),
                                 )
                     with gr.Group(elem_id="visualization-settings"):
@@ -792,6 +881,7 @@ def create_interface(api_key):
                 pipelines_enhancer,
                 api_key,
                 resolved_language,
+                exclude_overlapping_rods,
             ],
             outputs=[
                 output_image,
@@ -818,11 +908,222 @@ def create_interface(api_key):
             show_progress_on=in_image,
         )
 
+        analyze.success(
+            fn=initialize_manual_editor,
+            inputs=[output_image],
+            outputs=[
+                manual_editor_image,
+                manual_editor_base,
+                manual_draft_points,
+                manual_edit_action,
+                manual_editor_status,
+            ],
+            api_name=False,
+            show_progress="hidden",
+        )
+        analyze.success(
+            fn=capture_analysis_edit_context,
+            inputs=[points_df],
+            outputs=[
+                analysis_scale,
+                analysis_scale_input,
+                analysis_scale_selector,
+                analysis_solution,
+                analysis_sahi_mode,
+                analysis_round_value,
+            ],
+            api_name=False,
+            show_progress="hidden",
+        )
+
+        manual_add_mode.click(
+            fn=begin_manual_contour,
+            inputs=[
+                manual_add_action,
+                output_image,
+                selected_particle_ids,
+                points_df,
+                output_table,
+            ],
+            outputs=[
+                manual_edit_action,
+                manual_draft_points,
+                manual_editor_base,
+                manual_editor_image,
+                manual_editor_status,
+            ],
+            api_name=False,
+            show_progress="hidden",
+        )
+        manual_replace_mode.click(
+            fn=begin_manual_contour,
+            inputs=[
+                manual_replace_action,
+                output_image,
+                selected_particle_ids,
+                points_df,
+                output_table,
+            ],
+            outputs=[
+                manual_edit_action,
+                manual_draft_points,
+                manual_editor_base,
+                manual_editor_image,
+                manual_editor_status,
+            ],
+            api_name=False,
+            show_progress="hidden",
+        )
+        manual_editor_image.select(
+            fn=manual_editor_add_vertex,
+            inputs=[
+                manual_edit_action,
+                manual_draft_points,
+                manual_editor_base,
+                points_df,
+                selected_particle_ids,
+                output_table,
+            ],
+            outputs=[
+                manual_editor_image,
+                manual_draft_points,
+                manual_editor_status,
+            ],
+            api_name=False,
+            show_progress="hidden",
+        )
+        manual_undo_point.click(
+            fn=undo_manual_vertex,
+            inputs=[
+                manual_draft_points,
+                manual_editor_base,
+                points_df,
+                selected_particle_ids,
+                output_table,
+            ],
+            outputs=[
+                manual_editor_image,
+                manual_draft_points,
+                manual_editor_status,
+            ],
+            api_name=False,
+            show_progress="hidden",
+        )
+        manual_clear_draft.click(
+            fn=clear_manual_draft,
+            inputs=[
+                manual_editor_base,
+                points_df,
+                selected_particle_ids,
+                output_table,
+            ],
+            outputs=[
+                manual_editor_image,
+                manual_draft_points,
+                manual_editor_status,
+            ],
+            api_name=False,
+            show_progress="hidden",
+        )
+
+        manual_edit = manual_apply_contour.click(
+            fn=analyzer.apply_manual_contour_edit,
+            inputs=[
+                manual_edit_action,
+                manual_draft_points,
+                selected_particle_ids,
+                points_df,
+                output_table,
+                in_image,
+                analysis_scale,
+                analysis_scale_input,
+                analysis_scale_selector,
+                analysis_solution,
+                analysis_sahi_mode,
+                analysis_round_value,
+                exclude_border_rods,
+                image_name,
+                resolved_language,
+            ],
+            outputs=[
+                output_table,
+                points_df,
+                selected_particle_ids,
+                output_table_image2,
+                output_table_image2_row,
+                reset_delete_buttons_row,
+                manual_draft_points,
+                manual_edit_action,
+                manual_editor_status,
+                d_max_slider,
+                d_min_slider,
+                theta_max_slider,
+                theta_min_slider,
+                e_slider,
+                S_slider,
+                P_slider,
+                I_slider,
+            ],
+            api_name=False,
+            show_progress="hidden",
+        )
+        manual_stats = manual_edit.success(
+            fn=statistic_an,
+            inputs=[
+                output_table,
+                points_df,
+                analysis_scale_selector,
+                analysis_round_value,
+                number_of_bins,
+                d_max_slider,
+                d_min_slider,
+                theta_max_slider,
+                theta_min_slider,
+                e_slider,
+                S_slider,
+                P_slider,
+                I_slider,
+                in_image,
+                analysis_solution,
+                analysis_sahi_mode,
+                outline_color,
+                show_fillPoly,
+                show_polylines,
+                fill_type_color,
+                fill_color,
+                fill_alpha,
+                min_nanorod_aspect_ratio,
+                resolved_language,
+            ],
+            outputs=[
+                output_image,
+                output_table2,
+                output_plot,
+                vector_field,
+                nanorod_plot,
+            ],
+            api_name=False,
+        )
+        manual_stats.success(
+            fn=initialize_manual_editor,
+            inputs=[output_image],
+            outputs=[
+                manual_editor_image,
+                manual_editor_base,
+                manual_draft_points,
+                manual_edit_action,
+                manual_editor_status,
+            ],
+            api_name=False,
+            show_progress="hidden",
+        )
+
         output_image.select(
             select_particle_from_image,
-            inputs=[points_df, output_table],
+            inputs=[points_df, output_table, selected_particle_ids],
             outputs=[
                 output_table_image2,
+                selected_particle_ids,
                 output_table_image2_row,
                 reset_delete_buttons_row,
             ],
@@ -832,19 +1133,26 @@ def create_interface(api_key):
             translate_chatbot, [resolved_language], chatbot
         )
         
-        delete_row.click(
-            particle_removal,
+        delete_action = gr.on(
+            triggers=[delete_row.click, manual_delete_button.click],
+            fn=particle_removal,
             inputs=[
                 output_table_image2,
                 points_df,
                 output_table,
-                round_value,
-                scale_selector,
+                analysis_round_value,
+                analysis_scale_selector,
                 resolved_language,
+                in_image,
+                analysis_solution,
+                analysis_sahi_mode,
+                image_name,
             ],
             outputs=[
+                output_table_image2,
                 output_table_image2_row,
                 reset_delete_buttons_row,
+                selected_particle_ids,
                 points_df,
                 output_table,
                 d_max_slider,
@@ -858,13 +1166,14 @@ def create_interface(api_key):
             ],
             show_progress="hide",
             show_progress_on=[points_df],
-        ).success(
+        )
+        delete_stats = delete_action.success(
             fn=statistic_an,
             inputs=[
                 output_table,
                 points_df,
-                scale_selector,
-                round_value,
+                analysis_scale_selector,
+                analysis_round_value,
                 number_of_bins,
                 d_max_slider,
                 d_min_slider,
@@ -875,8 +1184,8 @@ def create_interface(api_key):
                 P_slider,
                 I_slider,
                 in_image,
-                solution,
-                sahi_mode,
+                analysis_solution,
+                analysis_sahi_mode,
                 outline_color,
                 show_fillPoly,
                 show_polylines,
@@ -894,13 +1203,33 @@ def create_interface(api_key):
                 nanorod_plot,
             ],
         )
+        delete_stats.success(
+            fn=initialize_manual_editor,
+            inputs=[output_image],
+            outputs=[
+                manual_editor_image,
+                manual_editor_base,
+                manual_draft_points,
+                manual_edit_action,
+                manual_editor_status,
+            ],
+            api_name=False,
+            show_progress="hidden",
+        )
         
         gr.on(
-            triggers=[reset_df.click, process_button.click],
+            triggers=[
+                reset_df.click,
+                process_button.click,
+                clear_button.click,
+                in_image.clear,
+                image_file.change,
+            ],
             fn=reset_selection,
-            inputs=output_table_image2,
+            inputs=[output_table_image2, selected_particle_ids],
             outputs=[
                 output_table_image2,
+                selected_particle_ids,
                 output_table_image2_row,
                 reset_delete_buttons_row,
             ],
@@ -927,8 +1256,8 @@ def create_interface(api_key):
             inputs=[
                 output_table,
                 points_df,
-                scale_selector,
-                round_value,
+                analysis_scale_selector,
+                analysis_round_value,
                 number_of_bins,
                 d_max_slider,
                 d_min_slider,
@@ -939,8 +1268,8 @@ def create_interface(api_key):
                 P_slider,
                 I_slider,
                 in_image,
-                solution,
-                sahi_mode,
+                analysis_solution,
+                analysis_sahi_mode,
                 outline_color,
                 show_fillPoly,
                 show_polylines,
@@ -1030,6 +1359,20 @@ def create_interface(api_key):
         )
 
         gr.on(
+            triggers=[clear_button.click, in_image.clear, image_file.change],
+            fn=clear_manual_editor_session,
+            outputs=[
+                manual_editor_image,
+                manual_editor_base,
+                manual_draft_points,
+                manual_edit_action,
+                manual_editor_status,
+            ],
+            api_name=False,
+            show_progress="hidden",
+        )
+
+        gr.on(
             triggers=[scale_selector.change, image_file.change],
             fn=reset_interface2,
             outputs=[
@@ -1078,7 +1421,8 @@ def create_interface(api_key):
             outputs=[question_row, tabs_row],
         )
 
-        output_table.change(
+        gr.on(
+            triggers=[output_table.change, output_table2.change],
             fn=save_data_to_csv_and_binary_mask,
             inputs=[image_name, output_table, output_table2],
             outputs=download_output,

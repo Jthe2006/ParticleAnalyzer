@@ -1,18 +1,20 @@
 import math
+from unittest.mock import Mock
 
 import cv2
 import numpy as np
 import pandas as pd
 import pytest
 
-from particleanalyzer.core.ParticleAnalyzer import ParticleAnalyzer
-from particleanalyzer.core.StatisticsBuilder import StatisticsBuilder
 from particleanalyzer.core.nanorod_analysis import (
     NanorodMetrics,
+    assess_nanrod_overlaps,
     calculate_nanorod_metrics,
     contour_touches_image_border,
     passes_nanorod_filter,
 )
+from particleanalyzer.core.ParticleAnalyzer import ParticleAnalyzer
+from particleanalyzer.core.StatisticsBuilder import StatisticsBuilder
 
 
 def _rotated_rectangle(length=60.0, width=20.0, angle=0.0):
@@ -110,6 +112,7 @@ def _analysis_config(points, **overrides):
         "nanorod_mode_enabled": True,
         "min_nanorod_aspect_ratio": 2.0,
         "exclude_border_rods": True,
+        "exclude_overlapping_rods": False,
     }
     config.update(overrides)
     return config
@@ -158,6 +161,429 @@ def test_border_touching_rod_can_be_excluded_or_retained():
     assert rejected["particle_data"] == []
     assert _analyzer()._analyze_particle(**retained) == 2
     assert retained["particle_data"][0]["Border touching"] is True
+
+
+def test_border_exclusion_is_independent_of_shape_analysis_mode():
+    border_particle = [(0, 30), (30, 30), (30, 60), (0, 60)]
+    rejected = _analysis_config(
+        border_particle,
+        nanorod_mode_enabled=False,
+        spherical_filter_enabled=False,
+        exclude_border_rods=True,
+    )
+    retained = _analysis_config(
+        border_particle,
+        nanorod_mode_enabled=False,
+        spherical_filter_enabled=False,
+        exclude_border_rods=False,
+    )
+
+    assert _analyzer()._analyze_particle(**rejected) == 1
+    assert rejected["particle_data"] == []
+    assert _analyzer()._analyze_particle(**retained) == 2
+    assert retained["particle_data"][0]["Border touching"] is True
+
+
+def test_border_exclusion_precedes_spherical_filter():
+    border_circle = cv2.ellipse2Poly((10, 50), (10, 10), 0, 0, 360, 5)
+    config = _analysis_config(
+        border_circle,
+        nanorod_mode_enabled=False,
+        spherical_filter_enabled=True,
+        exclude_border_rods=True,
+    )
+
+    assert _analyzer()._analyze_particle(**config) == 1
+    assert config["particle_data"] == []
+
+
+def _axis_aligned_rod(left, top, length=30, width=10):
+    return np.array(
+        [
+            (left, top),
+            (left + length, top),
+            (left + length, top + width),
+            (left, top + width),
+        ],
+        dtype=np.int32,
+    ).reshape((-1, 1, 2))
+
+
+def _overlap_qc_candidates():
+    reference_rods = [
+        _axis_aligned_rod(10 + 55 * (index % 5), 10 + 45 * (index // 5))
+        for index in range(10)
+    ]
+    duplicate = reference_rods[0].copy()
+    oversized_parent = _axis_aligned_rod(300, 70, length=80, width=30)
+    contained_rod = _axis_aligned_rod(325, 80)
+    return reference_rods + [duplicate, oversized_parent, contained_rod]
+
+
+def _parallel_pair_fixture(doublet: bool):
+    gray_image = np.full((240, 400), 190, dtype=np.uint8)
+    references = [
+        _axis_aligned_rod(10 + 65 * (index % 5), 10 + 45 * (index // 5), 42, 7)
+        for index in range(10)
+    ]
+    for reference in references:
+        cv2.fillPoly(gray_image, [reference], 100)
+
+    candidate = _axis_aligned_rod(300, 150, 42, 14)
+    if doublet:
+        cv2.rectangle(gray_image, (300, 150), (342, 156), 110, thickness=-1)
+        cv2.rectangle(gray_image, (300, 158), (342, 164), 115, thickness=-1)
+    else:
+        cv2.fillPoly(gray_image, [candidate], 110)
+    return references + [candidate], gray_image
+
+
+def _rotated_parallel_pair_fixture(angle):
+    height, width, scale = 260, 450, 2
+    high_resolution = np.full(
+        (height * scale, width * scale), 190, dtype=np.uint8
+    )
+    references = [
+        _axis_aligned_rod(10 + 65 * (index % 5), 10 + 45 * (index // 5), 42, 7)
+        for index in range(10)
+    ]
+    for reference in references:
+        scaled_reference = np.rint(
+            reference.reshape((-1, 2)) * scale
+        ).astype(np.int32)
+        cv2.fillPoly(high_resolution, [scaled_reference], 100)
+
+    center = np.asarray((370.0, 170.0))
+    radians = math.radians(angle)
+    normal = np.asarray((-math.sin(radians), math.cos(radians)))
+    candidate = cv2.boxPoints((tuple(center), (42.0, 14.0), angle)).reshape(
+        (-1, 1, 2)
+    )
+    for offset, intensity in ((-4.0, 110), (4.0, 115)):
+        rod_center = tuple((center + offset * normal) * scale)
+        rod = cv2.boxPoints(
+            (rod_center, (42.0 * scale, 6.0 * scale), angle)
+        )
+        cv2.fillPoly(high_resolution, [np.rint(rod).astype(np.int32)], intensity)
+    high_resolution = cv2.GaussianBlur(high_resolution, (0, 0), 1.2 * scale)
+    gray_image = cv2.resize(
+        high_resolution, (width, height), interpolation=cv2.INTER_AREA
+    )
+    return references + [candidate], gray_image
+
+
+def test_overlap_qc_removes_duplicate_and_oversized_parent_but_keeps_rods():
+    contours = _overlap_qc_candidates()
+    assessments = assess_nanrod_overlaps(
+        contours,
+        image_shape=(220, 420, 3),
+        confidences=[0.9] * 10 + [0.1, 0.95, 0.8],
+    )
+
+    assert all(not assessment.exclude for assessment in assessments[:10])
+    assert assessments[10].exclude
+    assert assessments[10].duplicate
+    assert assessments[10].reason == "duplicate_mask"
+    assert assessments[11].exclude
+    assert assessments[11].oversized
+    assert "oversized_cluster" in assessments[11].reason
+    assert not assessments[12].exclude
+
+
+def test_containment_qc_works_when_too_few_rods_exist_for_size_reference():
+    parent = _axis_aligned_rod(20, 20, length=80, width=30)
+    child = _axis_aligned_rod(45, 30)
+
+    assessments = assess_nanrod_overlaps(
+        [parent, child],
+        image_shape=(100, 140, 3),
+        min_reference_count=100,
+    )
+
+    assert assessments[0].exclude
+    assert assessments[0].reason == "contained_parent"
+    assert not assessments[1].exclude
+
+
+def test_containment_keeps_valid_child_over_higher_confidence_invalid_parent():
+    parent = _axis_aligned_rod(20, 20, length=31, width=17)
+    child = _axis_aligned_rod(20, 23, length=30, width=10)
+
+    assessments = assess_nanrod_overlaps(
+        [parent, child],
+        image_shape=(80, 100, 3),
+        confidences=[0.95, 0.80],
+        min_aspect_ratio=2.0,
+        min_reference_count=100,
+    )
+
+    assert assessments[0].exclude
+    assert assessments[0].reason == "contained_parent"
+    assert not assessments[1].exclude
+
+
+def test_isolated_long_rod_is_not_mislabeled_as_an_overlapping_cluster():
+    references = [
+        _axis_aligned_rod(10 + 55 * (index % 5), 10 + 45 * (index // 5))
+        for index in range(10)
+    ]
+    long_rod = _axis_aligned_rod(10, 140, length=150, width=10)
+
+    assessments = assess_nanrod_overlaps(
+        references + [long_rod],
+        image_shape=(200, 300, 3),
+    )
+
+    assert all(not assessment.exclude for assessment in assessments)
+
+
+def test_moderately_large_wide_concave_cluster_is_excluded():
+    references = [
+        _axis_aligned_rod(10 + 55 * (index % 5), 10 + 45 * (index // 5))
+        for index in range(10)
+    ]
+    cluster = np.asarray(
+        [
+            (300, 60),
+            (360, 60),
+            (360, 78),
+            (338, 78),
+            (338, 68),
+            (323, 68),
+            (323, 78),
+            (300, 78),
+        ],
+        dtype=np.int32,
+    ).reshape((-1, 1, 2))
+
+    assessments = assess_nanrod_overlaps(
+        references + [cluster],
+        image_shape=(180, 400, 3),
+    )
+
+    assert assessments[-1].exclude
+    assert assessments[-1].reason == "oversized_cluster"
+
+
+def test_parallel_grayscale_bands_confirm_a_side_by_side_merged_mask():
+    contours, gray_image = _parallel_pair_fixture(doublet=True)
+
+    assessments = assess_nanrod_overlaps(
+        contours,
+        image_shape=gray_image.shape,
+        gray_image=gray_image,
+    )
+
+    assert assessments[-1].exclude
+    assert assessments[-1].reason == "parallel_cluster"
+
+
+def test_one_thick_grayscale_band_is_not_mislabeled_as_parallel_rods():
+    contours, gray_image = _parallel_pair_fixture(doublet=False)
+
+    assessments = assess_nanrod_overlaps(
+        contours,
+        image_shape=gray_image.shape,
+        gray_image=gray_image,
+    )
+
+    assert not assessments[-1].exclude
+
+
+@pytest.mark.parametrize("angle", [-80, -45, -20, 0, 20, 45, 80])
+def test_parallel_grayscale_detection_is_rotation_invariant(angle):
+    contours, gray_image = _rotated_parallel_pair_fixture(angle)
+
+    assessments = assess_nanrod_overlaps(
+        contours,
+        image_shape=gray_image.shape,
+        gray_image=gray_image,
+    )
+
+    assert assessments[-1].exclude
+    assert assessments[-1].reason == "parallel_cluster"
+
+
+def test_spatial_sweep_ignores_vertical_nonoverlaps_before_pair_budget():
+    rods = [_axis_aligned_rod(10, 20 * index) for index in range(40)]
+    duplicate = rods[-1].copy()
+
+    assessments = assess_nanrod_overlaps(
+        rods + [duplicate],
+        image_shape=(850, 60, 3),
+        confidences=[0.9] * len(rods) + [0.1],
+        min_reference_count=100,
+        max_pair_checks=1,
+    )
+
+    assert assessments[-1].exclude
+    assert assessments[-1].duplicate
+    assert not assessments[-1].pair_limit_reached
+
+
+def test_overlap_assessment_reports_when_pair_budget_is_exhausted():
+    rod = _axis_aligned_rod(10, 10)
+
+    assessments = assess_nanrod_overlaps(
+        [rod, rod.copy(), rod.copy()],
+        image_shape=(50, 60, 3),
+        min_reference_count=100,
+        max_pair_checks=1,
+    )
+
+    assert all(assessment.pair_limit_reached for assessment in assessments)
+
+
+def test_sahi_multipolygons_are_filled_without_artificial_bridge():
+    polygons = [
+        [2, 2, 6, 2, 6, 6, 2, 6],
+        [14, 2, 18, 2, 18, 6, 14, 6],
+    ]
+
+    mask = _analyzer()._sahi_polygon_to_binary_mask(polygons, height=10, width=22)
+
+    assert mask[4, 4] == 1
+    assert mask[4, 16] == 1
+    assert mask[4, 10] == 0
+
+
+def test_batch_overlap_filter_has_no_export_or_drawing_side_effects(monkeypatch):
+    contours = _overlap_qc_candidates()
+    image = np.zeros((220, 420, 3), dtype=np.uint8)
+    config = _analysis_config(
+        [],
+        output_image=image,
+        gray_image=np.zeros(image.shape[:2], dtype=np.uint8),
+        exclude_border_rods=False,
+        exclude_overlapping_rods=True,
+    )
+    candidates = []
+    for index, contour in enumerate(contours):
+        raw_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(raw_mask, [contour], 1)
+        candidates.append(
+            {
+                "points": contour,
+                "raw_mask": raw_mask,
+                "confidence": 0.1 if index == 10 else 0.9,
+            }
+        )
+    info = Mock()
+    monkeypatch.setattr("gradio.Info", info)
+
+    particle_data, annotations = _analyzer()._process_particle_candidates(
+        candidates,
+        image,
+        thickness=1,
+        config=config,
+    )
+
+    assert len(particle_data) == 11
+    assert len(annotations) == 11
+    assert [row["№"] for row in particle_data] == list(range(1, 12))
+    info.assert_called_once()
+
+
+def test_batch_overlap_filter_can_be_disabled():
+    contours = _overlap_qc_candidates()
+    image = np.zeros((220, 420, 3), dtype=np.uint8)
+    config = _analysis_config(
+        [],
+        output_image=image,
+        gray_image=np.zeros(image.shape[:2], dtype=np.uint8),
+        exclude_border_rods=False,
+        exclude_overlapping_rods=False,
+    )
+    candidates = []
+    for contour in contours:
+        raw_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(raw_mask, [contour], 1)
+        candidates.append(
+            {"points": contour, "raw_mask": raw_mask, "confidence": 0.9}
+        )
+
+    particle_data, annotations = _analyzer()._process_particle_candidates(
+        candidates,
+        image,
+        thickness=1,
+        config=config,
+    )
+
+    assert len(particle_data) == len(contours)
+    assert len(annotations) == len(contours)
+
+
+def test_overlap_filter_operates_without_nanorod_or_spherical_mode(monkeypatch):
+    contour = _axis_aligned_rod(20, 20)
+    image = np.zeros((80, 100, 3), dtype=np.uint8)
+    config = _analysis_config(
+        [],
+        output_image=image,
+        gray_image=np.zeros(image.shape[:2], dtype=np.uint8),
+        nanorod_mode_enabled=False,
+        spherical_filter_enabled=False,
+        exclude_overlapping_rods=True,
+    )
+    candidates = []
+    for confidence in (0.9, 0.1):
+        raw_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(raw_mask, [contour], 1)
+        candidates.append(
+            {
+                "points": contour,
+                "raw_mask": raw_mask,
+                "confidence": confidence,
+            }
+        )
+    monkeypatch.setattr("gradio.Info", Mock())
+
+    particle_data, annotations = _analyzer()._process_particle_candidates(
+        candidates,
+        image,
+        thickness=1,
+        config=config,
+    )
+
+    assert len(particle_data) == 1
+    assert len(annotations) == 1
+
+
+def test_overlap_qc_only_compares_candidates_that_pass_spherical_filter():
+    circle = cv2.ellipse2Poly((50, 50), (10, 10), 0, 0, 360, 5).reshape(
+        (-1, 1, 2)
+    )
+    elongated_parent = _axis_aligned_rod(34, 42, length=32, width=16)
+    image = np.zeros((100, 100, 3), dtype=np.uint8)
+    config = _analysis_config(
+        [],
+        output_image=image,
+        gray_image=np.zeros(image.shape[:2], dtype=np.uint8),
+        nanorod_mode_enabled=False,
+        spherical_filter_enabled=True,
+        exclude_overlapping_rods=True,
+    )
+    candidates = []
+    for contour, confidence in ((elongated_parent, 0.99), (circle, 0.50)):
+        raw_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(raw_mask, [contour], 1)
+        candidates.append(
+            {
+                "points": contour,
+                "raw_mask": raw_mask,
+                "confidence": confidence,
+            }
+        )
+
+    particle_data, annotations = _analyzer()._process_particle_candidates(
+        candidates,
+        image,
+        thickness=1,
+        config=config,
+    )
+
+    assert len(particle_data) == 1
+    assert len(annotations) == 1
+    assert particle_data[0]["Axis ratio"] >= 0.8
 
 
 def test_scaling_changes_rod_dimensions_but_not_aspect_ratio():

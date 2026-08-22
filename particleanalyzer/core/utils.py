@@ -16,6 +16,10 @@ from particleanalyzer.core.ParticleAnalyzer import ParticleAnalyzer
 from particleanalyzer.core.StatisticsBuilder import StatisticsBuilder
 from particleanalyzer.core.ImagePreprocessor import ImagePreprocessor
 from particleanalyzer.core.nanorod_chart import build_nanorod_aspect_ratio_chart
+from particleanalyzer.core.manual_contour_editor import (
+    render_editor_preview,
+    write_contour_exports,
+)
 
 
 def assets_path(name: str):
@@ -294,7 +298,11 @@ def save_data_to_csv_and_binary_mask(
     output_dir: str = "output",
 ):
     """Сохраняет данные частиц в CSV файлы"""
-    if image_name is None:
+    if (
+        image_name is None
+        or not isinstance(data_table, pd.DataFrame)
+        or not isinstance(data_table2, pd.DataFrame)
+    ):
         return gr.skip()
     os.makedirs(output_dir, exist_ok=True)
     particle_path = os.path.join(
@@ -417,6 +425,8 @@ def statistic_an(
     selected_image, scale_factor_glob = ImagePreprocessor.resize_image(
         selected_image, solution, sahi_mode
     )
+    if df.empty:
+        return selected_image, pd.DataFrame(), None, None, None
 
     d_max_min, d_max_max = d_max_slider
     d_min_min, d_min_max = d_min_slider
@@ -512,17 +522,29 @@ def statistic_an(
     )
 
 
-selected_particles = []  # Глобальный список для хранения выбранных частиц
+def select_particle_from_image(
+    points_df, output_table, selected_particle_ids, evt: gr.SelectData
+):
+    """Select the smallest particle containing a click for this UI session."""
 
-
-def select_particle_from_image(points_df, output_table, evt: gr.SelectData):
-    global selected_particles
+    selected_particle_ids = list(selected_particle_ids or [])
+    if (
+        not isinstance(points_df, pd.DataFrame)
+        or not isinstance(output_table, pd.DataFrame)
+        or points_df.empty
+        or output_table.empty
+    ):
+        return gr.skip(), gr.skip(), gr.skip(), gr.skip()
     target_point = (evt.index[0], evt.index[1])
+    number_column = output_table.columns[0]
 
     matching_contours = []
     already_selected = False
 
-    for selected_idx in selected_particles:
+    selected_rows = output_table[
+        output_table[number_column].isin(selected_particle_ids)
+    ]
+    for selected_idx in selected_rows.index:
         contour_points = points_df.loc[selected_idx, "points"]
         if contour_points and len(contour_points) >= 3:
             contour = np.array(contour_points, dtype=np.int32).reshape((-1, 1, 2))
@@ -531,7 +553,7 @@ def select_particle_from_image(points_df, output_table, evt: gr.SelectData):
                 break
 
     if already_selected:
-        return gr.skip(), gr.skip(), gr.skip()
+        return gr.skip(), gr.skip(), gr.skip(), gr.skip()
 
     for idx, contour_points in points_df["points"].items():
         if not contour_points or len(contour_points) < 3:
@@ -540,11 +562,12 @@ def select_particle_from_image(points_df, output_table, evt: gr.SelectData):
         contour = np.array(contour_points, dtype=np.int32).reshape((-1, 1, 2))
         distance = cv2.pointPolygonTest(contour, target_point, measureDist=False)
 
-        if distance >= 0 and idx not in selected_particles:
+        particle_id = output_table.loc[idx, number_column]
+        if distance >= 0 and particle_id not in selected_particle_ids:
             matching_contours.append(idx)
 
     if not matching_contours:
-        return gr.skip(), gr.skip(), gr.skip()
+        return gr.skip(), gr.skip(), gr.skip(), gr.skip()
 
     if len(matching_contours) > 1:
         matching_contours.sort(
@@ -552,20 +575,206 @@ def select_particle_from_image(points_df, output_table, evt: gr.SelectData):
                 np.array(points_df.loc[x, "points"]).reshape((-1, 1, 2))
             )
         )
-    selected_particles.append(matching_contours[0])
+    selected_particle_ids.append(
+        output_table.loc[matching_contours[0], number_column]
+    )
+    selected_rows = output_table[
+        output_table[number_column].isin(selected_particle_ids)
+    ]
 
     return (
-        output_table.iloc[selected_particles],
+        selected_rows,
+        selected_particle_ids,
         gr.update(visible=True),
         gr.update(visible=True),
     )
 
 
-def reset_selection(output_table_image2):
-    global selected_particles
-    selected_particles = []
+def initialize_manual_editor(output_image):
+    """Reset the session-local polygon draft from the latest result image."""
+
+    if output_image is None:
+        return None, None, [], "idle", get_translation(
+            "Run image analysis before editing contours."
+        )
+    base_image = np.asarray(output_image).copy()
     return (
-        output_table_image2.iloc[[]],
+        base_image.copy(),
+        base_image,
+        [],
+        "idle",
+        get_translation("Choose Add or Replace to begin drawing."),
+    )
+
+
+def capture_analysis_edit_context(points_df):
+    """Read the exact coordinate and calibration basis used by an analysis."""
+
+    if not isinstance(points_df, pd.DataFrame):
+        return tuple(gr.skip() for _ in range(6))
+    context = points_df.attrs.get("analysis_edit_context")
+    if not isinstance(context, dict):
+        return tuple(gr.skip() for _ in range(6))
+    return (
+        context.get("scale"),
+        context.get("scale_input"),
+        context.get("scale_selector", "Pixels"),
+        context.get("solution", "Original"),
+        bool(context.get("sahi_mode", False)),
+        int(context.get("round_value", 4)),
+    )
+
+
+def clear_manual_editor_session():
+    """Clear all editor-only state when the source analysis is reset."""
+
+    return (
+        None,
+        None,
+        [],
+        "idle",
+        get_translation("Choose Add or Replace to begin drawing."),
+    )
+
+
+def begin_manual_contour(
+    action,
+    output_image,
+    selected_particle_ids,
+    points_df=None,
+    output_table=None,
+):
+    """Start an Add or Replace draft without mutating analysis results."""
+
+    if output_image is None:
+        return (
+            "idle",
+            [],
+            None,
+            None,
+            get_translation("Run image analysis before editing contours."),
+        )
+    selected_particle_ids = list(selected_particle_ids or [])
+    if action == "replace" and len(selected_particle_ids) != 1:
+        message = get_translation(
+            "Select exactly one particle before replacing its contour."
+        )
+        gr.Warning(message)
+        return "idle", [], output_image, output_image, message
+    base_image = np.asarray(output_image).copy()
+    preview = render_editor_preview(
+        base_image,
+        points_df,
+        [],
+        selected_particle_ids,
+        output_table,
+    )
+    message = get_translation(
+        "Click contour vertices in order, then choose Apply contour."
+    )
+    return action, [], base_image, preview, message
+
+
+def manual_editor_add_vertex(
+    action,
+    draft_points,
+    base_image,
+    points_df,
+    selected_particle_ids,
+    output_table,
+    evt: gr.SelectData,
+):
+    """Append one intrinsic image-coordinate vertex and redraw the draft."""
+
+    if action not in {"add", "replace"} or base_image is None:
+        message = get_translation("Choose Add or Replace before drawing.")
+        return gr.skip(), list(draft_points or []), message
+    x_coord, y_coord = (int(evt.index[0]), int(evt.index[1]))
+    height, width = np.asarray(base_image).shape[:2]
+    if not (0 <= x_coord < width and 0 <= y_coord < height):
+        return (
+            gr.skip(),
+            list(draft_points or []),
+            get_translation("The selected point is outside the analysis image."),
+        )
+    updated_draft = [list(point) for point in (draft_points or [])]
+    updated_draft.append([x_coord, y_coord])
+    preview = render_editor_preview(
+        base_image,
+        points_df,
+        updated_draft,
+        selected_particle_ids,
+        output_table,
+    )
+    status = get_translation("Draft vertices: {count}").format(
+        count=len(updated_draft)
+    )
+    return preview, updated_draft, status
+
+
+def undo_manual_vertex(
+    draft_points,
+    base_image,
+    points_df,
+    selected_particle_ids,
+    output_table,
+):
+    """Remove the most recently placed draft vertex."""
+
+    updated_draft = [list(point) for point in (draft_points or [])]
+    if updated_draft:
+        updated_draft.pop()
+    if base_image is None:
+        return None, updated_draft, get_translation(
+            "Run image analysis before editing contours."
+        )
+    preview = render_editor_preview(
+        base_image,
+        points_df,
+        updated_draft,
+        selected_particle_ids,
+        output_table,
+    )
+    return (
+        preview,
+        updated_draft,
+        get_translation("Draft vertices: {count}").format(
+            count=len(updated_draft)
+        ),
+    )
+
+
+def clear_manual_draft(
+    base_image,
+    points_df,
+    selected_particle_ids,
+    output_table,
+):
+    """Discard the open polygon while retaining the chosen edit mode."""
+
+    if base_image is None:
+        return None, [], get_translation(
+            "Run image analysis before editing contours."
+        )
+    preview = render_editor_preview(
+        base_image,
+        points_df,
+        [],
+        selected_particle_ids,
+        output_table,
+    )
+    return preview, [], get_translation("Draft cleared.")
+
+
+def reset_selection(output_table_image2, _selected_particle_ids=None):
+    empty_selection = (
+        output_table_image2.iloc[[]]
+        if isinstance(output_table_image2, pd.DataFrame)
+        else pd.DataFrame()
+    )
+    return (
+        empty_selection,
+        [],
         gr.update(visible=False),
         gr.update(visible=False),
     )
@@ -579,6 +788,10 @@ def particle_removal(
     scale_selector,
     selected_language="auto",
     request: gr.Request | None = None,
+    in_image=None,
+    solution="Original",
+    sahi_mode=False,
+    image_name=None,
 ):
     LanguageContext.set_language(
         resolve_language(
@@ -587,12 +800,23 @@ def particle_removal(
             fallback="en",
         )
     )
-    global selected_particles
-    if not output_table_image2.empty and "№" in output_table_image2.columns:
+    removed_particles = False
+    if (
+        isinstance(output_table_image2, pd.DataFrame)
+        and isinstance(points_df, pd.DataFrame)
+        and isinstance(output_table, pd.DataFrame)
+        and not output_table_image2.empty
+    ):
         try:
-            numbers_to_remove = output_table_image2["№"].astype(int).tolist()
+            number_column = output_table.columns[0]
+            selected_number_column = output_table_image2.columns[0]
+            numbers_to_remove = (
+                output_table_image2[selected_number_column].astype(int).tolist()
+            )
 
-            rows_to_remove = output_table[output_table["№"].isin(numbers_to_remove)]
+            rows_to_remove = output_table[
+                output_table[number_column].isin(numbers_to_remove)
+            ]
 
             if not rows_to_remove.empty:
                 output_table = output_table.drop(rows_to_remove.index).reset_index(
@@ -600,14 +824,52 @@ def particle_removal(
                 )
 
                 points_df = points_df.drop(rows_to_remove.index).reset_index(drop=True)
-                selected_particles = []
-        except (ValueError, KeyError) as e:
+                if not output_table.empty:
+                    output_table[number_column] = np.arange(1, len(output_table) + 1)
+                if in_image is not None and image_name:
+                    resized_image, _ = ImagePreprocessor.resize_image(
+                        np.asarray(in_image).copy(), solution, sahi_mode
+                    )
+                    write_contour_exports(
+                        points_df,
+                        resized_image.shape,
+                        image_name,
+                    )
+                removed_particles = True
+        except (ValueError, KeyError, OSError) as e:
             print(f"Ошибка при удалении строк: {e}")
-    limits = ParticleAnalyzer.calculate_limits(output_table, round_value)
+    if not removed_particles:
+        gr.Warning(get_translation("Select at least one particle before deleting."))
+    if output_table.empty:
+        limits = {
+            "d_max_min": 0,
+            "d_max_max": 1,
+            "d_min_min": 0,
+            "d_min_max": 1,
+            "theta_max_min": 0,
+            "theta_max_max": 180,
+            "theta_min_min": 0,
+            "theta_min_max": 180,
+            "S_min": 0,
+            "S_max": 1,
+            "P_min": 0,
+            "P_max": 1,
+            "I_min": 0,
+            "I_max": 255,
+        }
+    else:
+        limits = ParticleAnalyzer.calculate_limits(output_table, round_value)
     scale_selector = ParticleAnalyzer.SCALE_OPTIONS[scale_selector]
+    cleared_selection = (
+        output_table_image2.iloc[[]]
+        if isinstance(output_table_image2, pd.DataFrame)
+        else pd.DataFrame()
+    )
     return (
+        cleared_selection,
         gr.update(visible=False),
         gr.update(visible=False),
+        [],
         points_df,
         output_table,
         gr.update(

@@ -37,16 +37,30 @@ from particleanalyzer.core.shape_filter import (
     passes_shape_filter,
 )
 from particleanalyzer.core.nanorod_analysis import (
+    assess_nanrod_overlaps,
     calculate_nanorod_metrics,
     contour_touches_image_border,
     passes_nanorod_filter,
 )
 from particleanalyzer.core.nanorod_chart import build_nanorod_aspect_ratio_chart
+from particleanalyzer.core.manual_contour_editor import (
+    PolygonValidationError,
+    mutate_particle_tables,
+    normalize_polygon,
+    write_contour_exports,
+)
 
 lang = "en"
 
 
 class ParticleAnalyzer:
+    # Recall-oriented defaults calibrated on low-contrast TEM nanorod images.
+    DEFAULT_NANOROD_MODEL = "Yolo26 (dataset 11)"
+    DEFAULT_NANOROD_CONFIDENCE = 0.20
+    DEFAULT_NANOROD_IOU = 0.50
+    DEFAULT_NANOROD_SOLUTION = "1280x1280"
+    DEFAULT_NANOROD_ENHANCEMENT = "sem_edge_enhancement"
+
     SCALE_OPTIONS = {
         "Pixels": {
             "scale": False,
@@ -207,6 +221,7 @@ class ParticleAnalyzer:
         request: gr.Request,
         pr=gr.Progress(),
         selected_language: str = "auto",
+        exclude_overlapping_rods: bool = False,
     ) -> Tuple:
         """
         Основной метод для анализа изображения.
@@ -217,6 +232,7 @@ class ParticleAnalyzer:
             fallback=self.default_lang,
         )
         LanguageContext.set_language(lang)
+        scale_selector_name = scale_selector
         scale_selector = self.__class__.SCALE_OPTIONS[scale_selector]
         try:
             pbar = tqdm(
@@ -255,6 +271,9 @@ class ParticleAnalyzer:
 
             config = {
                 "image": image,
+                "inference_size": self._resolve_yolo_image_size(
+                    solution, image.shape
+                ),
                 "scale_input": scale_input,
                 "confidence_threshold": confidence_threshold,
                 "scale_selector": scale_selector,
@@ -278,6 +297,7 @@ class ParticleAnalyzer:
                 "nanorod_mode_enabled": nanorod_mode_enabled,
                 "min_nanorod_aspect_ratio": min_nanorod_aspect_ratio,
                 "exclude_border_rods": exclude_border_rods,
+                "exclude_overlapping_rods": exclude_overlapping_rods,
                 "show_Feret_diametr": show_Feret_diametr,
                 "outline_color": outline_color,
                 "show_fillPoly": show_fillPoly,
@@ -298,13 +318,23 @@ class ParticleAnalyzer:
                 return self._create_error_return()
 
             if not particle_data:
-                no_match_message = (
-                    "No nanorods matched the selected aspect-ratio and quality "
-                    "criteria. Lower the threshold or allow border-touching rods."
-                    if nanorod_mode_enabled
-                    else "No particles matched the 2D shape filter. Lower the "
-                    "thresholds or disable the filter."
-                )
+                if nanorod_mode_enabled:
+                    no_match_message = (
+                        "No nanorods matched the selected aspect-ratio and quality "
+                        "criteria. Lower the threshold or allow border-touching/merged rods."
+                    )
+                elif spherical_filter_enabled:
+                    no_match_message = (
+                        "No particles matched the 2D shape filter. Lower the "
+                        "thresholds or disable the filter."
+                    )
+                elif exclude_overlapping_rods:
+                    no_match_message = (
+                        "No particles remained after overlap quality control. "
+                        "Disable overlap exclusion to inspect ambiguous masks."
+                    )
+                else:
+                    no_match_message = "Объекты не обнаружены."
                 gr.Info(
                     self._get_translation(no_match_message)
                 )
@@ -320,6 +350,14 @@ class ParticleAnalyzer:
 
             df = pd.DataFrame(particle_data)
             points_df = pd.DataFrame(df["points"])
+            points_df.attrs["analysis_edit_context"] = {
+                "scale": scale,
+                "scale_input": scale_input,
+                "scale_selector": scale_selector_name,
+                "solution": solution,
+                "sahi_mode": bool(sahi_mode),
+                "round_value": int(round_value),
+            }
 
             self._df_to_coco(points_df, output_image, image_name)
 
@@ -418,6 +456,23 @@ class ParticleAnalyzer:
         finally:
             self._cleanup(pbar)
 
+    @staticmethod
+    def _resolve_yolo_image_size(solution: str, image_shape=None) -> int:
+        """Convert a square UI resolution profile to Ultralytics ``imgsz``."""
+
+        match = re.fullmatch(r"\s*(\d+)\s*[xX]\s*(\d+)\s*", str(solution))
+        if match:
+            width, height = (int(value) for value in match.groups())
+            if width > 0 and height > 0:
+                return max(width, height)
+        if str(solution).strip().casefold() in {"original", "оригинал"}:
+            if image_shape is not None and len(image_shape) >= 2:
+                longest_side = max(int(image_shape[0]), int(image_shape[1]))
+                if longest_side > 0:
+                    # Ultralytics requires dimensions divisible by its stride.
+                    return ((longest_side + 31) // 32) * 32
+        return 640
+
     def _select_processor(self, model_name: str, sahi_mode: bool):
         """Выбор стратегии обработки в зависимости от модели и режима"""
         if sahi_mode:
@@ -471,7 +526,7 @@ class ParticleAnalyzer:
         thickness = self._get_scaled_thickness(
             output_image.shape[1], output_image.shape[0]
         )
-        particle_counter, particle_data, annotations = 1, [], []
+        candidates = []
 
         # Обработка детекций
         for i in range(len(results.xyxy)):
@@ -486,17 +541,22 @@ class ParticleAnalyzer:
                     main_contour = max(contours, key=cv2.contourArea)
                     points = main_contour.reshape(-1, 2)
 
-                    particle_counter = self._analyze_particle(
-                        points=points,
-                        output_image=output_image,
-                        thickness=thickness,
-                        particle_data=particle_data,
-                        annotations=annotations,
-                        raw_mask=mask,
-                        particle_counter=particle_counter,
-                        **config,
+                    confidence = (
+                        float(results.confidence[i])
+                        if results.confidence is not None
+                        else 0.0
+                    )
+                    candidates.append(
+                        {
+                            "points": points,
+                            "raw_mask": mask,
+                            "confidence": confidence,
+                        }
                     )
 
+        particle_data, annotations = self._process_particle_candidates(
+            candidates, output_image, thickness, config
+        )
         config["pbar"].update(1)
         return output_image, particle_data, annotations
 
@@ -514,7 +574,7 @@ class ParticleAnalyzer:
             with torch.no_grad():
                 results = model(
                     config["image"],
-                    imgsz=640,
+                    imgsz=config.get("inference_size", 640),
                     verbose=False,
                     conf=config["confidence_threshold"],
                     retina_masks=True,
@@ -549,20 +609,25 @@ class ParticleAnalyzer:
         thickness = self._get_scaled_thickness(
             output_image.shape[1], output_image.shape[0]
         )
-        particle_counter, particle_data, annotations = 1, [], []
+        candidates = []
         for r in results:
             if r.masks is not None and len(r.masks.xy) > 0:
-                for mask, mask2 in zip(r.masks.xy, r.masks.data.cpu().numpy()):
-                    particle_counter = self._analyze_particle(
-                        points=mask,
-                        output_image=output_image,
-                        thickness=thickness,
-                        particle_data=particle_data,
-                        annotations=annotations,
-                        raw_mask=mask2,
-                        particle_counter=particle_counter,
-                        **config,
+                scores = r.boxes.conf.detach().cpu().numpy()
+                for index, (mask, mask2) in enumerate(
+                    zip(r.masks.xy, r.masks.data.cpu().numpy())
+                ):
+                    candidates.append(
+                        {
+                            "points": mask,
+                            "raw_mask": mask2,
+                            "confidence": (
+                                float(scores[index]) if index < len(scores) else 0.0
+                            ),
+                        }
                     )
+        particle_data, annotations = self._process_particle_candidates(
+            candidates, output_image, thickness, config
+        )
         config["pbar"].update(1)
         return output_image, particle_data, annotations
 
@@ -582,7 +647,9 @@ class ParticleAnalyzer:
         try:
             predictor = DefaultPredictor(cfg)
             results = predictor(config["image"])
-            masks = results["instances"].pred_masks.to("cpu").numpy()
+            instances = results["instances"]
+            masks = instances.pred_masks.to("cpu").numpy()
+            scores = instances.scores.to("cpu").numpy()
         except Exception as e:
             self._handle_error(e)
             return None, None, None
@@ -603,8 +670,8 @@ class ParticleAnalyzer:
         thickness = self._get_scaled_thickness(
             output_image.shape[1], output_image.shape[0]
         )
-        particle_counter, particle_data, annotations = 1, [], []
-        for mask in masks:
+        candidates = []
+        for index, mask in enumerate(masks):
             contours, _ = cv2.findContours(
                 mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
@@ -612,16 +679,16 @@ class ParticleAnalyzer:
                 continue
             contour = max(contours, key=cv2.contourArea)
             points = contour.squeeze()
-            particle_counter = self._analyze_particle(
-                points=points,
-                output_image=output_image,
-                thickness=thickness,
-                particle_data=particle_data,
-                annotations=annotations,
-                raw_mask=mask,
-                particle_counter=particle_counter,
-                **config,
+            candidates.append(
+                {
+                    "points": points,
+                    "raw_mask": mask,
+                    "confidence": float(scores[index]) if index < len(scores) else 0.0,
+                }
             )
+        particle_data, annotations = self._process_particle_candidates(
+            candidates, output_image, thickness, config
+        )
         config["pbar"].update(1)
         return output_image, particle_data, annotations
 
@@ -676,33 +743,165 @@ class ParticleAnalyzer:
             output_image.shape[1], output_image.shape[0]
         )
 
-        image_height, image_width = config["orig_image"].shape[:2]
-
-        particle_counter, particle_data, annotations = 1, [], []
+        candidates = []
         for r in results.object_prediction_list:
             mask = r.mask.segmentation
-            mask2 = self._sahi_polygon_to_binary_mask(mask, image_height, image_width)
             if isinstance(mask, list) and len(mask) > 0:
-                flat_coords = (
-                    np.concatenate(mask).astype(np.int32)
-                    if isinstance(mask[0], list)
-                    else np.array(mask, dtype=np.int32)
+                mask_array = self._sahi_polygon_to_binary_mask(
+                    mask, output_image.shape[0], output_image.shape[1]
                 )
-                if flat_coords.shape[0] < 6:
+                contours, _ = cv2.findContours(
+                    mask_array, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                if not contours:
                     continue
-                points = flat_coords.reshape(-1, 1, 2)
-                particle_counter = self._analyze_particle(
-                    points=points,
-                    output_image=output_image,
-                    thickness=thickness,
-                    particle_data=particle_data,
-                    annotations=annotations,
-                    raw_mask=mask2,
-                    particle_counter=particle_counter,
-                    **config,
+                points = max(contours, key=cv2.contourArea)
+                candidates.append(
+                    {
+                        "points": points,
+                        "raw_mask": None,
+                        "confidence": float(r.score.value),
+                    }
                 )
+        particle_data, annotations = self._process_particle_candidates(
+            candidates, output_image, thickness, config
+        )
         config["pbar"].update(1)
         return output_image, particle_data, annotations
+
+    def _process_particle_candidates(
+        self,
+        candidates,
+        output_image,
+        thickness,
+        config,
+    ):
+        """Apply batch-level overlap QC before drawing or exporting particles."""
+
+        particle_data, annotations = [], []
+        shared_config = {
+            key: value
+            for key, value in config.items()
+            if key
+            not in {
+                "points",
+                "output_image",
+                "thickness",
+                "particle_data",
+                "annotations",
+                "raw_mask",
+                "particle_counter",
+            }
+        }
+        assessments = None
+        if config.get("exclude_overlapping_rods", False) and candidates:
+            eligible_indices = [
+                index
+                for index, candidate in enumerate(candidates)
+                if self._candidate_passes_active_filter(
+                    candidate["points"], output_image.shape, config
+                )
+            ]
+            eligible_candidates = [candidates[index] for index in eligible_indices]
+            eligible_assessments = assess_nanrod_overlaps(
+                contours=[
+                    candidate["points"] for candidate in eligible_candidates
+                ],
+                image_shape=output_image.shape,
+                confidences=[
+                    candidate["confidence"] for candidate in eligible_candidates
+                ],
+                min_aspect_ratio=(
+                    config.get("min_nanorod_aspect_ratio", 2.0)
+                    if config.get("nanorod_mode_enabled", False)
+                    else 1.0
+                ),
+                gray_image=config.get("gray_image"),
+            )
+            assessments = [None] * len(candidates)
+            for index, assessment in zip(
+                eligible_indices, eligible_assessments, strict=True
+            ):
+                assessments[index] = assessment
+            if eligible_assessments and eligible_assessments[0].pair_limit_reached:
+                gr.Warning(
+                    self._get_translation(
+                        "Overlap QC reached its comparison limit; some ambiguous masks may remain."
+                    )
+                )
+            excluded_count = sum(item.exclude for item in eligible_assessments)
+            if excluded_count:
+                gr.Info(
+                    self._get_translation(
+                        "Excluded {count} likely merged or duplicate masks."
+                    ).format(count=excluded_count)
+                )
+
+        particle_counter = 1
+        image_height, image_width = output_image.shape[:2]
+        for index, candidate in enumerate(candidates):
+            if (
+                assessments is not None
+                and assessments[index] is not None
+                and assessments[index].exclude
+            ):
+                continue
+            raw_mask = candidate["raw_mask"]
+            if raw_mask is None:
+                segmentation = candidate.get("segmentation")
+                if segmentation is not None:
+                    raw_mask = self._sahi_polygon_to_binary_mask(
+                        segmentation, image_height, image_width
+                    )
+                else:
+                    raw_mask = np.zeros(
+                        (image_height, image_width), dtype=np.uint8
+                    )
+                    points = np.asarray(
+                        candidate["points"], dtype=np.int32
+                    ).reshape((-1, 1, 2))
+                    cv2.fillPoly(raw_mask, [points], 1)
+            particle_counter = self._analyze_particle(
+                points=candidate["points"],
+                output_image=output_image,
+                thickness=thickness,
+                particle_data=particle_data,
+                annotations=annotations,
+                raw_mask=raw_mask,
+                particle_counter=particle_counter,
+                **shared_config,
+            )
+        return particle_data, annotations
+
+    @staticmethod
+    def _candidate_passes_active_filter(points, image_shape, config) -> bool:
+        """Predict whether a candidate can reach the active result population."""
+
+        if len(points) < 3:
+            return False
+        contour = np.asarray(points, dtype=np.int32).reshape((-1, 1, 2))
+        touches_border = contour_touches_image_border(contour, image_shape)
+        if config.get("exclude_border_rods", False) and touches_border:
+            return False
+        if config.get("nanorod_mode_enabled", False):
+            return passes_nanorod_filter(
+                metrics=calculate_nanorod_metrics(contour),
+                min_aspect_ratio=config.get("min_nanorod_aspect_ratio", 2.0),
+                touches_border=touches_border,
+                exclude_border_rods=False,
+            )
+        if config.get("spherical_filter_enabled", False):
+            return passes_shape_filter(
+                metrics=calculate_shape_metrics(
+                    area=cv2.contourArea(contour),
+                    perimeter=cv2.arcLength(contour, closed=True),
+                    contour=contour,
+                ),
+                enabled=True,
+                min_circularity=config.get("min_circularity", 0.75),
+                min_axis_ratio=config.get("min_axis_ratio", 0.80),
+            )
+        return True
 
     def _analyze_particle(self, **config) -> int:
         """Анализ отдельной частицы с расчетом Feret-диаметров"""
@@ -750,12 +949,14 @@ class ParticleAnalyzer:
             perimeter=perimeter,
             contour=points,
         )
+        if config.get("exclude_border_rods", False) and touches_border:
+            return config["particle_counter"]
         if config.get("nanorod_mode_enabled", False):
             if not passes_nanorod_filter(
                 metrics=nanorod_metrics,
                 min_aspect_ratio=config.get("min_nanorod_aspect_ratio", 2.0),
                 touches_border=touches_border,
-                exclude_border_rods=config.get("exclude_border_rods", True),
+                exclude_border_rods=False,
             ):
                 return config["particle_counter"]
         elif not passes_shape_filter(
@@ -884,6 +1085,235 @@ class ParticleAnalyzer:
         )
 
         return config["particle_counter"] + 1
+
+    def measure_manual_contour(
+        self,
+        points,
+        particle_number,
+        in_image,
+        scale,
+        scale_input,
+        scale_selector,
+        solution,
+        sahi_mode,
+        round_value,
+        exclude_border_particles=False,
+        selected_language="auto",
+        request: gr.Request | None = None,
+    ):
+        """Measure one user-drawn contour with the normal particle formulas.
+
+        Manual polygons intentionally bypass detector shape and overlap filters. The
+        independent border-quality option is still honored because a clipped manual
+        contour has the same metrology bias as a detected one.
+        """
+
+        if in_image is None:
+            return None
+        lang = resolve_language(
+            selected_language,
+            request.headers.get("Accept-Language", "") if request else "",
+            fallback=self.default_lang,
+        )
+        LanguageContext.set_language(lang)
+        resized_rgb, scale_factor_glob = ImagePreprocessor.resize_image(
+            np.asarray(in_image).copy(), solution, sahi_mode
+        )
+        if resized_rgb.ndim == 2:
+            gray_image = resized_rgb.copy()
+            output_image = cv2.cvtColor(resized_rgb, cv2.COLOR_GRAY2BGR)
+        else:
+            output_image = cv2.cvtColor(resized_rgb, cv2.COLOR_RGB2BGR)
+            gray_image = cv2.cvtColor(output_image, cv2.COLOR_BGR2GRAY)
+
+        scale_config = self.SCALE_OPTIONS[scale_selector]
+        if scale_config["scale"] and (scale is None or float(scale) <= 0):
+            return None
+
+        particle_data = []
+        contour = np.asarray(points, dtype=np.int32).reshape((-1, 1, 2))
+        self._analyze_particle(
+            points=contour,
+            output_image=output_image,
+            thickness=self._get_scaled_thickness(
+                output_image.shape[1], output_image.shape[0]
+            ),
+            particle_data=particle_data,
+            annotations=None,
+            raw_mask=None,
+            particle_counter=int(particle_number),
+            gray_image=gray_image,
+            scale_input=scale_input,
+            scale=scale,
+            scale_factor_glob=scale_factor_glob,
+            scale_selector=scale_config,
+            round_value=int(round_value),
+            nanorod_mode_enabled=False,
+            min_nanorod_aspect_ratio=1.0,
+            exclude_border_rods=bool(exclude_border_particles),
+            spherical_filter_enabled=False,
+            min_circularity=0.0,
+            min_axis_ratio=0.0,
+            show_fillPoly=False,
+            show_polylines=False,
+            show_Feret_diametr=False,
+            fill_type_color="Random",
+            fill_color="rgb(0, 255, 0, 1)",
+            fill_alpha=0.0,
+            outline_color="rgb(0, 255, 0, 1)",
+            lang=lang,
+        )
+        return particle_data[0] if particle_data else None
+
+    def apply_manual_contour_edit(
+        self,
+        action,
+        draft_points,
+        selected_particle_ids,
+        points_df,
+        output_table,
+        in_image,
+        scale,
+        scale_input,
+        scale_selector,
+        solution,
+        sahi_mode,
+        round_value,
+        exclude_border_particles,
+        image_name,
+        selected_language="auto",
+        request: gr.Request | None = None,
+    ):
+        """Atomically add or replace a manually drawn particle polygon."""
+
+        def fail(message):
+            raise gr.Error(self._get_translation(message))
+
+        lang = resolve_language(
+            selected_language,
+            request.headers.get("Accept-Language", "") if request else "",
+            fallback=self.default_lang,
+        )
+        LanguageContext.set_language(lang)
+        if action not in {"add", "replace"}:
+            return fail("Choose Add or Replace before applying a contour.")
+        if not isinstance(output_table, pd.DataFrame) or not isinstance(
+            points_df, pd.DataFrame
+        ):
+            return fail("Run image analysis before editing contours.")
+        selected_particle_ids = list(selected_particle_ids or [])
+        if action == "replace" and len(selected_particle_ids) != 1:
+            return fail(
+                "Select exactly one particle before replacing its contour."
+            )
+        if in_image is None:
+            return fail("Run image analysis before editing contours.")
+
+        resized_image, _ = ImagePreprocessor.resize_image(
+            np.asarray(in_image).copy(), solution, sahi_mode
+        )
+        try:
+            contour = normalize_polygon(draft_points, resized_image.shape)
+        except PolygonValidationError as error:
+            return fail(f"Invalid contour: {error}")
+
+        if action == "replace":
+            particle_number = int(selected_particle_ids[0])
+        elif output_table.empty:
+            particle_number = 1
+        else:
+            particle_number = int(
+                pd.to_numeric(output_table.iloc[:, 0], errors="coerce").max()
+            ) + 1
+
+        record = self.measure_manual_contour(
+            points=contour,
+            particle_number=particle_number,
+            in_image=in_image,
+            scale=scale,
+            scale_input=scale_input,
+            scale_selector=scale_selector,
+            solution=solution,
+            sahi_mode=sahi_mode,
+            round_value=round_value,
+            exclude_border_particles=exclude_border_particles,
+            selected_language=lang,
+            request=request,
+        )
+        if record is None:
+            if exclude_border_particles and contour_touches_image_border(
+                contour, resized_image.shape
+            ):
+                return fail(
+                    "The contour touches the image border and was not applied because border exclusion is enabled."
+                )
+            return fail("The contour could not be measured.")
+
+        try:
+            updated_table, updated_points = mutate_particle_tables(
+                action,
+                record,
+                selected_particle_ids,
+                output_table,
+                points_df,
+            )
+            if image_name:
+                write_contour_exports(
+                    updated_points,
+                    resized_image.shape,
+                    image_name,
+                    output_dir=self.output_dir,
+                )
+        except (ValueError, KeyError, OSError) as error:
+            return fail(f"The contour edit could not be saved: {error}")
+
+        status = self._get_translation(
+            "A new contour was added and measured."
+            if action == "add"
+            else "The selected contour was replaced and remeasured."
+        )
+        slider_updates = self._manual_slider_updates(
+            updated_table, int(round_value)
+        )
+        return (
+            updated_table,
+            updated_points,
+            [],
+            updated_table.iloc[[]],
+            gr.update(visible=False),
+            gr.update(visible=False),
+            [],
+            "idle",
+            status,
+            *slider_updates,
+        )
+
+    @classmethod
+    def _manual_slider_updates(cls, output_table, round_value):
+        """Expand every sidebar range so a new manual contour stays visible."""
+
+        limits = cls.calculate_limits(output_table, round_value)
+
+        def range_update(minimum, maximum, with_step=False):
+            values = {
+                "minimum": minimum,
+                "maximum": maximum,
+                "value": (minimum, maximum),
+            }
+            if with_step:
+                values["step"] = max(abs(float(maximum)) * 0.01, 10 ** (-round_value))
+            return gr.update(**values)
+
+        return (
+            range_update(limits["d_max_min"], limits["d_max_max"], True),
+            range_update(limits["d_min_min"], limits["d_min_max"], True),
+            range_update(limits["theta_max_min"], limits["theta_max_max"]),
+            range_update(limits["theta_min_min"], limits["theta_min_max"]),
+            gr.update(minimum=0, maximum=1, value=(0, 1)),
+            range_update(limits["S_min"], limits["S_max"], True),
+            range_update(limits["P_min"], limits["P_max"], True),
+            range_update(limits["I_min"], limits["I_max"]),
+        )
 
     def _draw_feret_lines(self, image, contour, angle, color=(0, 255, 0), thickness=2):
         """Отрисовка Feret-линий"""
@@ -1360,37 +1790,34 @@ class ParticleAnalyzer:
             return mask
 
         try:
-            # Быстрое выравнивание через itertools (избегаем рекурсии)
-            from collections.abc import Iterable
+            first = sahi_polygon[0]
+            if np.isscalar(first):
+                polygons = [sahi_polygon]
+            elif all(
+                hasattr(item, "__len__")
+                and len(item) == 2
+                and all(np.isscalar(value) for value in item)
+                for item in sahi_polygon
+            ):
+                # Also accept a single polygon represented as [[x, y], ...].
+                polygons = [sahi_polygon]
+            else:
+                polygons = sahi_polygon
 
-            def flatten_fast(lst):
-                for item in lst:
-                    if isinstance(item, Iterable) and not isinstance(
-                        item, (str, bytes)
-                    ):
-                        yield from flatten_fast(item)
-                    else:
-                        yield item
+            valid_polygons = []
+            for polygon in polygons:
+                flat_coords = np.asarray(polygon, dtype=np.float32).reshape(-1)
+                if len(flat_coords) < 6 or len(flat_coords) & 1:
+                    continue
+                points = flat_coords.reshape(-1, 2).astype(np.int32)
+                np.clip(points[:, 0], 0, width - 1, out=points[:, 0])
+                np.clip(points[:, 1], 0, height - 1, out=points[:, 1])
+                valid_polygons.append(points)
 
-            flat_coords = np.fromiter(flatten_fast(sahi_polygon), dtype=np.float32)
-
-            # Проверяем четность координат
-            if len(flat_coords) & 1:
-                print(f"Warning: Odd number of coordinates: {len(flat_coords)}")
-                return mask
-
-            points = flat_coords.reshape(-1, 2).astype(np.int32)
-
-            # Минимум 3 точки для полигона
-            if len(points) < 3:
-                return mask
-
-            # Клиппинг векторизованный
-            np.clip(points[:, 0], 0, width - 1, out=points[:, 0])
-            np.clip(points[:, 1], 0, height - 1, out=points[:, 1])
-
-            # Создаем маску
-            cv2.fillPoly(mask, [points], color=1)
+            if valid_polygons:
+                # Fill each COCO polygon independently. Flattening all polygons
+                # into one contour creates artificial bridge edges.
+                cv2.fillPoly(mask, valid_polygons, color=1)
 
         except Exception as e:
             print(f"Error in _sahi_polygon_to_binary_mask: {e}")
